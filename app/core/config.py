@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
 
-    DATABASE_URL: str = "sqlite:///./app.db"
+    DATABASE_URL: str = "mysql+pymysql://resume:resume_pass_2026@127.0.0.1:3306/resume_db?charset=utf8mb4"
     DB_ECHO: bool = False
 
     UPLOAD_DIR: Path = Path("uploads")
@@ -52,19 +52,20 @@ class Settings(BaseSettings):
 
     @field_validator("DATABASE_URL", mode="after")
     @classmethod
-    def _normalize_sqlite_path(cls, value: str) -> str:
-        """把 sqlite 的相对路径改写成基于项目根目录的绝对路径。
+    def _check_database_url(cls, value: str) -> str:
+        """启动时就校验驱动前缀，而不是等第一个请求打进来才发现配错。
 
-        否则同一份配置在 api 进程和 celery worker 里会因 cwd 不同而指向两个库。
+        必须是 mysql+pymysql:// 形式：
+        - mysql     是 SQLAlchemy 的方言名，决定用哪套 SQL 生成规则
+        - +pymysql  是具体驱动，决定用哪个 Python 库发连接
+        少了驱动部分，SQLAlchemy 会去找 MySQLdb（需要编译，Windows 上装不上）。
         """
-        prefix = "sqlite:///"
-        if not value.startswith(prefix):
-            return value
-        raw = value[len(prefix) :]
-        if raw.startswith("/") or (len(raw) > 1 and raw[1] == ":"):
-            return value
-        absolute = (BASE_DIR / raw).resolve()
-        return f"{prefix}{absolute.as_posix()}"
+        if not value.startswith(("mysql+pymysql://", "mysql+mysqldb://")):
+            raise ValueError(
+                "DATABASE_URL 必须以 mysql+pymysql:// 开头，当前为: "
+                f"{value.split('://')[0] if '://' in value else value}"
+            )
+        return value
 
     @field_validator("UPLOAD_DIR", mode="after")
     @classmethod

@@ -5,6 +5,9 @@
 *.db
 *.sqlite3
 
+# Docker 里的 MySQL 数据目录（几百 MB，绝不能提交）
+docker/mysql-data/
+
 # Python 缓存
 __pycache__/
 *.py[cod]

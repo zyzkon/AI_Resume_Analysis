@@ -5,14 +5,21 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import settings
 
-_is_sqlite = settings.DATABASE_URL.startswith("sqlite")
-
 engine = create_engine(
     settings.DATABASE_URL,
-    # SQLite 默认禁止跨线程复用连接，而 FastAPI 的同步路由跑在线程池里
-    connect_args={"check_same_thread": False} if _is_sqlite else {},
-    # 从池里取连接前先探活，避免拿到被服务端单方面断开的老连接
+    # 从池里取连接前先探活。MySQL 有 wait_timeout（默认 8 小时），
+    # 中间的网络设备往往更短，闲置连接会被单方面断开，
+    # 不探活的话下一次请求会拿到死连接直接报 OperationalError。
     pool_pre_ping=True,
+    # 连接用满 1 小时就主动丢弃重建。pre_ping 只能救"已经被断"的连接，
+    # recycle 是从根上不让连接活到被断的时候，两者配合才算稳。
+    pool_recycle=3600,
+    # 常驻连接数。同步路由跑在线程池里，默认线程池 40，
+    # 这里 10+20=30 上限够用，又不会把 MySQL 的 max_connections 打满。
+    pool_size=10,
+    max_overflow=20,
+    # 池子耗尽时最多等多久，超时抛 TimeoutError 而不是无限挂住请求
+    pool_timeout=30,
     echo=settings.DB_ECHO,
 )
 
