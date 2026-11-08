@@ -10,9 +10,14 @@
 4. 根本不是 JSON / 缺字段      -> 只能重试，交给 llm.py 的循环处理
 """
 
+from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+# 状态枚举从 models 里复用，不在这里重复定义一份 Literal。
+# 两份定义在项目里并存的话，某天加了个新状态，必然有一处忘记同步。
+from app.models.analysis import AnalysisStatus
 
 # 一份合格的技术岗简历应该覆盖的栏目。
 # 固定成常量而不是让模型自由发挥，是为了让不同简历的检查结果能横向对比。
@@ -147,3 +152,103 @@ class AnalysisResult(BaseModel):
         if len(value) < 4:
             raise ValueError(f"至少需要检查 4 个栏目，只收到 {len(value)} 个")
         return value[:8]
+
+
+# ---------------------------------------------------------------- 接口出入参
+
+
+class AnalysisCreate(BaseModel):
+    """提交分析时的请求体。
+
+    只有一个字段，而且整体可以不传 —— 前端直接 POST 空 body 也能按通用标准跑一遍。
+    """
+
+    job_description: str | None = Field(
+        default=None,
+        max_length=2000,
+        description="目标岗位 JD。不传则按通用技术岗标准评估匹配度",
+    )
+
+    @field_validator("job_description")
+    @classmethod
+    def _blank_to_none(cls, value: str | None) -> str | None:
+        """空字符串和纯空格都当作"没填"。
+
+        前端表单未填写时通常提交 ""，原样存进 jd_text 的话，
+        Prompt 里会多出一段空的【目标岗位】，模型的判断容易被这段空白带偏。
+        """
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
+
+
+class AnalysisOut(BaseModel):
+    """分析记录的完整出参。
+
+    result 从 JSON 列读出来是个 dict，这里直接声明成 AnalysisResult，
+    Pydantic 会把它再校验一遍 —— 相当于对"几个月前存进去的数据"
+    做一次结构回归测试。模型改过字段之后，老数据能不能读出来一目了然。
+    """
+
+    id: int
+    resume_id: int
+    status: AnalysisStatus
+    jd_text: str | None = None
+    match_score: int | None = Field(default=None, description="从 result 抽出的冗余列")
+    result: AnalysisResult | None = Field(default=None, description="完整分析结果，未完成时为 null")
+    model_name: str | None = None
+    prompt_version: str
+    error_message: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("created_at", "started_at", "finished_at")
+    @classmethod
+    def _ensure_utc(cls, value: datetime | None) -> datetime | None:
+        """MySQL 的 DATETIME 不存时区，读出来是 naive 的，补上 UTC 标记。
+
+        和 ResumeOut 里那份是同一套逻辑，但三个字段里有两个可为 None，
+        所以要先判空，不能照抄。
+        """
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+
+class AnalysisListItem(BaseModel):
+    """历史列表里的一条。
+
+    刻意不带 result 全文：一次分析的结果 JSON 有一两千字，
+    20 条就是几十 KB，而列表页只想回答"哪次分析、几分、什么状态"。
+    overall_score 和 summary 是从 result 里挑出来的两个摘要字段。
+    """
+
+    id: int
+    resume_id: int
+    status: AnalysisStatus
+    match_score: int | None = None
+    overall_score: int | None = None
+    summary: str | None = None
+    created_at: datetime
+
+    @field_validator("created_at")
+    @classmethod
+    def _ensure_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+
+class AnalysisListOut(BaseModel):
+    """分页外壳，形状和 ResumeListOut 保持一致，前端不用记两套。"""
+
+    total: int
+    page: int
+    size: int
+    items: list[AnalysisListItem]

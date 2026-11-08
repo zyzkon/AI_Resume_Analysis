@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import auth, resumes
+from app.api.routes import analyses, auth, resumes
 from app.core.config import settings
 
 tags_metadata = [
@@ -46,6 +46,8 @@ app.add_middleware(
 # 每个模块自己持有 router，main 只负责拼装，模块之间互不导入。
 app.include_router(auth.router)
 app.include_router(resumes.router)
+app.include_router(analyses.router)
+app.include_router(analyses.analysis_router)
 
 
 @app.get("/health", tags=["系统"], summary="健康检查")
