@@ -7,8 +7,9 @@
 调用约定的三条：
 1. 成功返回 AnalysisOutcome，里面是校验过的 AnalysisResult + 用量元数据
 2. 失败一律抛 LLMError 的子类，上层只需要 except LLMError
-3. 不在这一层重试网络错误超过 settings.LLM_MAX_RETRIES 次，
-   更长的重试交给 Celery 的任务级策略（阶段 6），避免两层重试叠成几分钟
+3. 不在这一层重试网络错误超过 settings.LLM_MAX_RETRIES 次。
+   任务级重试由 Celery 决定，但 apply 在任务上的策略是"不重试"：
+   两层都开会让一次超时变成 3×3=9 次请求，用户等 8 分钟才看到失败
 """
 
 import json

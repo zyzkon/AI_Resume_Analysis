@@ -4,11 +4,12 @@
 Prompt 怎么拼、模型怎么调、输出怎么校验，全部在 services/llm.py 里，
 这一层不该出现任何 if settings.LLM_PROVIDER 之类的判断。
 
-当前是同步实现：请求打进来 -> 调模型 -> 写库 -> 返回，用户要等满整个分析时间。
-阶段 6 会改成"创建 pending 记录立刻返回，Celery worker 后台跑"，
-届时接口形状不变，只是 status 会先返回 pending / running。
+当前是异步实现：接口建一条 pending 记录、把 id 丢进 Celery 队列，
+立刻返回 202；真正的模型调用在 app/workers/tasks.py 里跑，
+前端拿 id 轮询 GET /analyses/{id} 看 status 从 pending -> running -> done/failed。
 """
 
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -26,8 +27,10 @@ from app.schemas.analysis import (
     AnalysisListOut,
     AnalysisOut,
 )
-from app.services.llm import LLMError, analyze_resume
 from app.services.prompts import PROMPT_VERSION
+from app.workers.tasks import run_analysis
+
+logger = logging.getLogger(__name__)
 
 # 两个前缀没法共用一个 APIRouter：
 # 提交和列表挂在某份简历下面（/resumes/{id}/analyses），
@@ -76,9 +79,13 @@ def _to_list_item(analysis: Analysis) -> AnalysisListItem:
 @router.post(
     "/{resume_id}/analyses",
     response_model=AnalysisOut,
-    status_code=status.HTTP_201_CREATED,
-    summary="提交分析",
-    description="同步执行：调模型、写库、返回完整结果。失败时返回 502，失败记录仍保留。",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="提交分析（异步）",
+    description=(
+        "建一条 pending 记录后立刻返回，实际的模型调用在后台 worker 里执行。\n\n"
+        "拿返回的 id 轮询 `GET /analyses/{id}`，status 会依次变成 "
+        "`pending` -> `running` -> `done`（或 `failed`，此时 error_message 有原因）。"
+    ),
 )
 def create_analysis(
     resume_id: int,
@@ -90,55 +97,48 @@ def create_analysis(
 
     if not (resume.raw_text or "").strip():
         # 阶段 3 的解析器对扫描件会抛错，理论上进不来；
-        # 但库里可能存着历史数据，或解析后正文被清空过，这里再兜一道
+        # 但库里可能存着历史数据，或解析后正文被清空过，这里再兜一道。
+        # 放在建记录之前：这种请求根本不该占一条队列名额
         raise HTTPException(status_code=400, detail="这份简历没有可用正文，无法分析")
 
     jd_text = payload.job_description if payload else None
 
-    # 先落一条 running 记录，再调模型。
-    # 这一次 commit 的意义：如果调模型的过程中进程被杀（Ctrl+C、OOM、断网卡死），
-    # 数据库里会留下一条永远停在 running 的记录 —— 一眼就能看出是哪条出了问题。
-    # 如果等全部跑完再一次性写入，进程一死就什么都不剩，等于这次请求从没发生过。
+    # 先落库、再投递。顺序反过来的话，worker 可能在记录还不存在时就开始跑，
+    # db.get 拿不到东西，任务直接 return "not_found"，用户看到一条永远 pending 的分析
     analysis = Analysis(
         resume_id=resume.id,
         user_id=current_user.id,
         jd_text=jd_text,
-        status=AnalysisStatus.RUNNING,
-        # 在这里就写下版本号，而不是等成功后再补。
-        # 否则失败记录会落成建表时的 server_default "v1"，
-        # 一个项目里从未存在过的版本号，看数据时会被误导
+        status=AnalysisStatus.PENDING,
+        # 版本号在这里就写。等到 worker 成功后再补的话，
+        # 失败记录会落成建表时的 server_default "v1"，一个项目里从未存在过的版本号
         prompt_version=PROMPT_VERSION,
-        started_at=datetime.now(timezone.utc),
+        # started_at 故意不写：它表示"worker 真正开始跑的时刻"，
+        # 由任务自己落，这样 created_at 与它之差就是排队耗时
     )
     db.add(analysis)
     db.commit()
-    db.refresh(analysis)  # created_at 是数据库生成的，不 refresh 拿到的是 None
+    db.refresh(analysis)  # id 和 created_at 都是数据库生成的
 
     try:
-        outcome = analyze_resume(resume.raw_text, jd_text)
-    except LLMError as exc:
-        # 失败也要落库：用户需要知道"这次试过、失败了、原因是什么"，
-        # 否则列表里看不到记录，会以为是接口没生效
+        run_analysis.delay(analysis.id)
+    except Exception as exc:  # noqa: BLE001
+        # 这里 catch 得宽是有意的：Redis 挂了、序列化失败、broker 拒绝连接，
+        # 异常类型随底层库版本变化。共同后果只有一个 —— 任务没进队列。
+        # 不兜住的话，用户会看到 202 + pending 的记录，然后永远等不到结果
+        logger.exception("任务投递失败 analysis_id=%s", analysis.id)
         analysis.status = AnalysisStatus.FAILED
-        analysis.error_message = str(exc)[:500]
+        analysis.error_message = f"任务投递失败：{exc}"[:500]
         analysis.finished_at = datetime.now(timezone.utc)
         db.commit()
-        # 502 而不是 500：错在模型服务（网关之后的上游），不在我们自己
-        raise HTTPException(status_code=502, detail=f"分析失败：{exc}") from exc
+        # 503 而不是 500：是"队列这个依赖暂时不可用"，重试有意义，客户端该退避后再来
+        raise HTTPException(
+            status_code=503,
+            detail="分析队列暂不可用，请稍后重试",
+        ) from exc
 
-    # mode="json" 不能省：普通 model_dump() 会留下 StrEnum、
-    # 以及将来可能出现的 datetime，MySQL 的 JSON 列写不进去
-    analysis.result = outcome.result.model_dump(mode="json")
-    analysis.match_score = outcome.result.match_score
-    analysis.model_name = outcome.model
-    analysis.prompt_version = outcome.prompt_version
-    analysis.status = AnalysisStatus.DONE
-    analysis.finished_at = datetime.now(timezone.utc)
-    db.commit()
-
-    # 从库里读回来再返回，而不是直接返回内存里的对象。
-    # 这样 response_model 校验的是 MySQL 实际存下的那份 JSON，
-    # 序列化踩坑（比如某字段存成了字符串）当场就会暴露，而不是等前端发现
+    # 再读一次：worker 可能已经领走任务并把状态改成 running 了，
+    # 直接返回能让前端少一轮无意义的轮询
     db.refresh(analysis)
     return analysis
 

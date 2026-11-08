@@ -5,6 +5,11 @@
 ### 顺序：注册 -> 登录 -> 上传 -> 分析 -> 查询。
 ### token / resume_id / analysis_id 由上一行响应自动写进全局变量，
 ### 不用手动复制粘贴。
+###
+### 注意：分析是异步的，第 7 步只是把任务丢进队列。
+### 想看到 done，必须另开一个终端跑 worker：
+###   celery -A app.workers.celery_app:celery_app worker -l info -P solo
+### （Windows 必须加 -P solo，prefork 在 Windows 上起不来）
 ### ============================================================
 
 @host = http://127.0.0.1:8000
@@ -95,9 +100,12 @@ GET {{host}}/resumes/{{resume_id}}
 Authorization: Bearer {{token}}
 
 ###
-# 7. 提交分析（同步执行，可能要等十几秒）
+# 7. 提交分析（异步，立刻返回 202）
+# 返回的 status 是 pending，真正的模型调用在 Celery worker 里跑。
 # body 可以整个不传；传 job_description 则会额外给出岗位匹配度 match_score。
-# 返回的 id 存进 analysis_id。
+# 返回的 id 存进 analysis_id，下一步用它轮询。
+# 前置条件：worker 必须已启动，否则记录会一直停在 pending
+#   celery -A app.workers.celery_app:celery_app worker -l info -P solo
 POST {{host}}/resumes/{{resume_id}}/analyses
 Authorization: Bearer {{token}}
 Content-Type: application/json
@@ -108,8 +116,7 @@ Content-Type: application/json
 
 > {%
     client.global.set("analysis_id", response.body.id);
-    client.global.set("match_score", response.body.match_score);
-    client.log("status = " + response.body.status + "，match_score = " + response.body.match_score);
+    client.log("id = " + response.body.id + "，status = " + response.body.status);
 %}
 
 ###
@@ -122,7 +129,10 @@ Authorization: Bearer {{token}}
 %}
 
 ###
-# 8. 查分析结果（含完整 result JSON）
+# 8. 轮询分析结果
+# status: pending（排队中）-> running（worker 在跑）-> done / failed
+# done 时 result 才有完整内容；failed 时看 error_message。
+# 拿 mock 模型跑通常两秒内就 done，多连点几次即可
 GET {{host}}/analyses/{{analysis_id}}
 Authorization: Bearer {{token}}
 
