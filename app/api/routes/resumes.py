@@ -165,7 +165,16 @@ def list_resumes(
         .limit(size)
     ).all()
 
-    return ResumeListOut(total=total, page=page, size=size, items=list(items))
+    # 显式做一次 ORM -> schema 的转换，而不是把 ORM 对象直接塞进 items。
+    # 运行时两种写法都能跑（response_model 反正会再校验一遍），
+    # 但 items 声明的是 list[ResumeOut]，塞 Resume 进去是类型上的谎话，
+    # 而且一旦以后给 ResumeOut 加了计算属性，自动转换会悄悄绕开它
+    return ResumeListOut(
+        total=total,
+        page=page,
+        size=size,
+        items=[ResumeOut.model_validate(r) for r in items],
+    )
 
 
 @router.get("/{resume_id}", response_model=ResumeDetailOut, summary="简历详情")

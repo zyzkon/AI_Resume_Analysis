@@ -1,0 +1,5 @@
+# 开发期依赖，不装进生产环境。
+# 用法：pip install -r requirements-dev.txt
+-r requirements.txt
+
+mypy==2.4.1

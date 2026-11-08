@@ -68,7 +68,11 @@ def _to_list_item(analysis: Analysis) -> AnalysisListItem:
     return AnalysisListItem(
         id=analysis.id,
         resume_id=analysis.resume_id,
-        status=analysis.status,
+        # 列上声明的是 Mapped[str]（String(20)），取出来是裸字符串；
+        # 而 schema 里 status 是 AnalysisStatus 枚举。Pydantic 本来也会做这层转换，
+        # 这里显式转一次是为了让"数据库里的字符串"和"接口上的枚举"在类型上对齐，
+        # 顺便把脏数据的报错点提到构造这一行，而不是藏在序列化过程里
+        status=AnalysisStatus(analysis.status),
         match_score=analysis.match_score,
         overall_score=result.get("overall_score"),
         summary=result.get("summary"),

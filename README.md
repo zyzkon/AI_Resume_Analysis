@@ -214,6 +214,23 @@ app/
 
 **输出容错分层**：数值越界钳制（105 → 100）、枚举拼错归一化（`urgent` → `high`）、列表过长截断，只有「不是 JSON」「缺必填字段」才触发重试 —— 目的是把重试次数压到最低，每次重试都在烧 token。
 
+## 代码检查
+
+```bash
+pip install -r requirements-dev.txt   # 只有 mypy，不污染生产依赖
+mypy                                  # 配置在 mypy.ini，默认检查 app/ 下的 30 个文件
+```
+
+`mypy.ini` 里开了 `warn_unused_ignores`、`warn_redundant_casts`、`warn_unreachable`、`no_implicit_optional`、`strict_equality` —— 这几项除了 `warn_unreachable` 之外几乎零误报，属于「开了不亏」。
+
+目前唯一的 `# type: ignore` 在 `app/core/config.py` 的 `Settings()`：`SECRET_KEY` 是必填项，但值来自运行时才读取的 `.env`，mypy 静态看不到，属于误报。
+
+另外三个模型（`user` / `resume` / `analysis`）之间互相引用，运行时靠 relationship 的字符串类名解析，类型检查则需要 `if TYPE_CHECKING:` 下的真实导入 —— 少了它 mypy 会报 `Name "Resume" is not defined`，加上它又不会引入循环导入。
+
+## 换行符
+
+仓库里统一存 LF（`.gitattributes` 里 `* text=auto eol=lf`）。不加这一行的话，Windows 上 `core.autocrlf=true` 会导致两个后果：每次提交都提示 `LF will be replaced by CRLF`；以及 Linux/macOS 上 clone 后提交时出现「整个文件都被改过」的假 diff。
+
 ## 待办
 
 - [ ] Alembic 迁移（现在 `create_all` 只能建表，改字段要手工 ALTER）

@@ -1,9 +1,19 @@
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import Boolean, DateTime, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
+
+if TYPE_CHECKING:
+    # 这三个模型互相引用（user.resumes / resume.owner / analysis.user），
+    # 运行时靠 relationship 里的字符串名解析，不需要真的导入，
+    # 否则 user.py 导入 resume.py、resume.py 又导入 user.py，直接循环导入崩掉。
+    # 但类型检查器看不懂"字符串形式的类名"，必须在这里给它一个真名，
+    # 否则 mypy 会报 Name "Resume" is not defined
+    from app.models.analysis import Analysis
+    from app.models.resume import Resume
 
 
 class User(Base):

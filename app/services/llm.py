@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 
 from openai import APIError, APITimeoutError, OpenAI
+from openai.types.chat import ChatCompletionMessageParam
 from pydantic import ValidationError
 
 from app.core.config import settings
@@ -106,7 +107,11 @@ def _openai_analyze(text: str, job_description: str | None) -> AnalysisOutcome:
         max_retries=0,
     )
 
-    messages: list[dict] = [
+    # 必须标成 ChatCompletionMessageParam 而不是裸 list[dict]：
+    # 裸 dict 让 mypy 把所有取值都推成 Any，SDK 里一堆 Literal（role 只能取
+    # "system"/"user"/"assistant" 等）和 TypedDict 就在眼皮底下失效了，
+    # 写错 role 拼写也不会被任何工具拦下
+    messages: list[ChatCompletionMessageParam] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": build_user_prompt(text, job_description)},
     ]

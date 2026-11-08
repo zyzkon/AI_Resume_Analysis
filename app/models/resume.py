@@ -1,9 +1,16 @@
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import DateTime, ForeignKey, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
+
+if TYPE_CHECKING:
+    # 仅给类型检查器用，运行时不导入（避免模型间的循环导入）。
+    # 细节见 app/models/user.py 里的同一段注释
+    from app.models.analysis import Analysis
+    from app.models.user import User
 
 
 class Resume(Base):

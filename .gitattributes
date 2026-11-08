@@ -1,0 +1,30 @@
+# 统一换行符：仓库里一律存 LF，检出时也保持 LF。
+# 不加这个文件，Windows 上 core.autocrlf=true 会把文本转成 CRLF 再提交回去，
+# 于是 git 每次都提示 "LF will be replaced by CRLF"；
+# 更麻烦的是 Linux/macOS 上 clone 下来再提交，会出现「整个文件都被改过」的假 diff。
+* text=auto eol=lf
+
+# 明确声明语言类型，让 GitHub 的 diff 高亮和语言统计更准
+*.py          text diff=python
+*.md          text diff=markdown
+*.txt         text
+*.yml         text
+*.yaml        text
+*.toml        text
+*.ini         text
+*.cfg         text
+*.http        text
+*.json        text
+.env.example  text
+
+# 二进制文件必须显式标出来，否则 git 会尝试按文本做换行符转换，
+# 结果就是文件损坏（PDF 里恰好含 0x0D 0x0A 的字节序列时尤其明显）
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.docx  binary
+*.xlsx  binary
+*.zip   binary

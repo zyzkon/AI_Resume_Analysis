@@ -106,7 +106,9 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    # SECRET_KEY 是必填项（Field(...) 无默认值），值来自 .env 或环境变量。
+    # mypy 看不到运行时才加载的 .env，会以为这个参数漏传了，属于误报
+    return Settings()  # type: ignore[call-arg]
 
 
 settings = get_settings()

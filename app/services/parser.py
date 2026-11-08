@@ -55,7 +55,9 @@ def parse_docx(path: Path) -> str:
     工作经历、教育背景经常塞在表格里，只读 doc.paragraphs 会漏掉大半内容，
     而且不会报错，只是分析结果莫名其妙地差。
     """
-    doc = Document(path)
+    # python-docx 的类型标注只写了 str | IO[bytes]，运行时其实也接受 Path。
+    # 显式转一次 str，既让类型检查通过，也避免老版本 python-docx 对 Path 处理不一
+    doc = Document(str(path))
 
     parts: list[str] = [p.text for p in doc.paragraphs if p.text.strip()]
 
