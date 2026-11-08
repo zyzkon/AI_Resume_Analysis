@@ -1,11 +1,187 @@
-# Test your FastAPI endpoints
+### ============================================================
+### 简历分析 API 调试脚本（PyCharm / IntelliJ HTTP Client）
+### 用法：先启动服务 uvicorn app.main:app --reload，
+###       然后点每个请求左侧的绿色箭头，或右上角 "Run all"。
+### 顺序：注册 -> 登录 -> 上传 -> 分析 -> 查询。
+### token / resume_id / analysis_id 由上一行响应自动写进全局变量，
+### 不用手动复制粘贴。
+### ============================================================
 
-GET http://127.0.0.1:8000/
-Accept: application/json
+@host = http://127.0.0.1:8000
+@email = demo@example.com
+@password = Passw0rd!
+@resume_file = ./uploads/f517dc825fdf41158e08c74c87455813.docx
 
 ###
-
-GET http://127.0.0.1:8000/hello/User
-Accept: application/json
+# 0. 健康检查（不需要登录）
+GET {{host}}/health
 
 ###
+# 1. 注册
+# 成功返回 201。同一邮箱重复跑会返回 409 —— 这是正常的防重复逻辑，
+# 换掉上面的 @email 或者直接跳到第 2 步即可。
+POST {{host}}/auth/register
+Content-Type: application/json
+
+{
+  "email": "{{email}}",
+  "password": "{{password}}"
+}
+
+###
+# 2. 登录（JSON，前端用这个）
+# 响应里的 access_token 会被下面的脚本写进全局变量 token，
+# 后续所有受保护接口都用 {{token}} 引用它。
+POST {{host}}/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{email}}",
+  "password": "{{password}}"
+}
+
+> {%
+    client.global.set("token", response.body.access_token);
+    client.log("token 已保存：" + response.body.access_token);
+%}
+
+###
+# 2b. 登录（表单，OAuth2 标准，等价于 Swagger 的 Authorize 按钮）
+# 注意字段名固定是 username/password，不是 email —— 这是 OAuth2 规范定的，
+# username 里填邮箱。
+POST {{host}}/auth/token
+Content-Type: application/x-www-form-urlencoded
+
+username={{email}}&password={{password}}
+
+> {%
+    client.global.set("token", response.body.access_token);
+%}
+
+###
+# 3. 当前登录用户
+# 故意写错 token 会返回 401 且响应头带 WWW-Authenticate: Bearer
+GET {{host}}/auth/me
+Authorization: Bearer {{token}}
+
+###
+# 4. 上传简历（multipart，字段名必须是 file）
+# 只接受 .pdf / .docx，超过 5MB 返回 413，扩展名或魔数不对返回 415。
+# 返回的 id 存进 resume_id。
+POST {{host}}/resumes
+Authorization: Bearer {{token}}
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="file"; filename="resume.docx"
+Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document
+
+< {{resume_file}}
+--WebAppBoundary--
+
+> {%
+    client.global.set("resume_id", response.body.id);
+    client.log("resume_id = " + response.body.id);
+%}
+
+###
+# 5. 我的简历列表（分页）
+GET {{host}}/resumes?page=1&size=10
+Authorization: Bearer {{token}}
+
+###
+# 6. 简历详情（含正文前 500 字）
+GET {{host}}/resumes/{{resume_id}}
+Authorization: Bearer {{token}}
+
+###
+# 7. 提交分析（同步执行，可能要等十几秒）
+# body 可以整个不传；传 job_description 则会额外给出岗位匹配度 match_score。
+# 返回的 id 存进 analysis_id。
+POST {{host}}/resumes/{{resume_id}}/analyses
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "job_description": "招聘 Python 后端工程师：熟悉 FastAPI / SQLAlchemy / MySQL，有 LLM 应用经验优先，本科及以上学历。"
+}
+
+> {%
+    client.global.set("analysis_id", response.body.id);
+    client.global.set("match_score", response.body.match_score);
+    client.log("status = " + response.body.status + "，match_score = " + response.body.match_score);
+%}
+
+###
+# 7b. 提交分析（不传 JD，按通用技术岗标准评估）
+POST {{host}}/resumes/{{resume_id}}/analyses
+Authorization: Bearer {{token}}
+
+> {%
+    client.global.set("analysis_id", response.body.id);
+%}
+
+###
+# 8. 查分析结果（含完整 result JSON）
+GET {{host}}/analyses/{{analysis_id}}
+Authorization: Bearer {{token}}
+
+###
+# 9. 某份简历的分析历史
+# status 可能是 running / done / failed；failed 的记录里 error_message 有原因。
+GET {{host}}/resumes/{{resume_id}}/analyses?page=1&size=20
+Authorization: Bearer {{token}}
+
+###
+# ---------------- 以下是错误分支演示，看懂返回码即可 ----------------
+
+# 401：不带 token
+GET {{host}}/auth/me
+
+###
+# 401：token 是乱码
+GET {{host}}/auth/me
+Authorization: Bearer this.is.not.a.jwt
+
+###
+# 401：邮箱密码不对
+POST {{host}}/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{email}}",
+  "password": "wrong-password"
+}
+
+###
+# 404：别人的简历 / 不存在的 id（越权查询统一按"不存在"处理，不泄露存在性）
+GET {{host}}/resumes/999999
+Authorization: Bearer {{token}}
+
+###
+# 422：密码不足 8 位 / 邮箱格式不对，字段级错误会指明位置
+POST {{host}}/auth/register
+Content-Type: application/json
+
+{
+  "email": "not-an-email",
+  "password": "123"
+}
+
+###
+# 415：上传 .txt（扩展名就不在白名单里）
+POST {{host}}/resumes
+Authorization: Bearer {{token}}
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="file"; filename="resume.txt"
+Content-Type: text/plain
+
+< ./test_main.http
+--WebAppBoundary--
+
+###
+# 删除简历（会连同磁盘文件和它的分析记录一起删掉，谨慎执行）
+# DELETE {{host}}/resumes/{{resume_id}}
+# Authorization: Bearer {{token}}
