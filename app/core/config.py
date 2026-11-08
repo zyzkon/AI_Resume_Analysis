@@ -1,7 +1,8 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -43,12 +44,21 @@ class Settings(BaseSettings):
 
     REDIS_URL: str = "redis://localhost:6379/0"
 
-    LLM_PROVIDER: str = "mock"
+    # ---- 大模型 ----
+    # mock 不联网、不花钱、结果确定；openai 走 OpenAI 兼容接口
+    # （DeepSeek、通义、Kimi、本地 vLLM 都兼容这一套，只改 BASE_URL 和 MODEL）
+    LLM_PROVIDER: Literal["mock", "openai"] = "mock"
     LLM_API_KEY: str = ""
     LLM_BASE_URL: str = "https://api.deepseek.com/v1"
     LLM_MODEL: str = "deepseek-chat"
-    LLM_TIMEOUT: int = 120
+    LLM_TIMEOUT: float = 90.0
     LLM_MAX_RETRIES: int = 2
+    # 温度压到 0.2：简历打分需要可复现，同样的简历两次分析不该差出 20 分
+    LLM_TEMPERATURE: float = 0.2
+    LLM_MAX_TOKENS: int = 2048
+    # 送进模型前的硬上限。20000 字已经是很长的简历了，
+    # 再长基本是 PDF 解析时把页眉页脚、二维码说明都吸进来了，截断反而更准
+    LLM_MAX_INPUT_CHARS: int = 20000
 
     @field_validator("DATABASE_URL", mode="after")
     @classmethod
@@ -71,6 +81,23 @@ class Settings(BaseSettings):
     @classmethod
     def _normalize_upload_dir(cls, value: Path) -> Path:
         return value if value.is_absolute() else (BASE_DIR / value).resolve()
+
+    @field_validator("LLM_API_KEY", mode="after")
+    @classmethod
+    def _require_key_for_real_provider(cls, value: str, info: ValidationInfo) -> str:
+        """配了真实通道却没给 key，启动就报错。
+
+        等第一个分析请求打进来才报 401，那时候用户已经等了半分钟，
+        而且排查时容易怀疑到网络、额度、模型名上去。
+        """
+        provider = info.data.get("LLM_PROVIDER", "mock")
+        if provider != "mock" and not value.strip():
+            raise ValueError(f"LLM_PROVIDER={provider} 时必须配置 LLM_API_KEY")
+        return value.strip()
+
+    @property
+    def llm_is_mock(self) -> bool:
+        return self.LLM_PROVIDER == "mock"
 
     def ensure_dirs(self) -> None:
         """应用启动时调用，保证上传目录存在。"""
