@@ -115,3 +115,17 @@ class Token(BaseModel):
     access_token: str = Field(description="放在 Authorization: Bearer 后面")
     token_type: str = Field(default="bearer", description="固定为 bearer")
     expires_in: int = Field(description="有效期，单位秒")
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "access_token": (
+                    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+                    ".eyJzdWIiOiIxIiwiZXhwIjoxNzk0MTIzNDU2fQ"
+                    ".3vJ8kQ2mNpR7sT1xY6bW9cZ4dF5gH0jL-aE8uI2oK7M"
+                ),
+                "token_type": "bearer",
+                "expires_in": 86400,
+            }
+        }
+    )

@@ -11,7 +11,7 @@
 """
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -156,6 +156,54 @@ class AnalysisResult(BaseModel):
 
 # ---------------------------------------------------------------- 接口出入参
 
+# 文档示例用的完整结果。写成模块级常量而不是内联：
+# AnalysisOut 和（将来的）其他地方都要用它，内联的话改一处漏一处。
+# 内容按真实 mock 输出的形状写 —— 示例和实际响应差太远，比没有示例更误导人。
+_RESULT_EXAMPLE: dict[str, Any] = {
+    "overall_score": 62,
+    "summary": "后端技术栈与目标岗位基本匹配；项目描述偏重功能罗列，缺少量化结果。",
+    "completeness": [
+        {"name": "基本信息", "present": True, "comment": "姓名、手机、邮箱齐全"},
+        {"name": "教育背景", "present": True, "comment": "学校与专业完整，缺 GPA 或排名"},
+        {
+            "name": "工作/实习经历",
+            "present": True,
+            "comment": "有两段实习，但只写了做了什么，没写结果",
+        },
+        {"name": "项目经历", "present": True, "comment": "项目描述缺少技术选型的理由"},
+        {"name": "专业技能", "present": True, "comment": "技能罗列完整，未标注熟练度"},
+        {"name": "自我评价", "present": False, "comment": "建议补一段，两行以内即可"},
+    ],
+    "highlights": ["技术栈与岗位高度重合", "有真实上线的后端项目"],
+    "weaknesses": ["项目成果缺少量化指标", "工作经历描述过于笼统"],
+    "match_score": 58,
+    "match_reason": "岗位要求的 FastAPI 与 SQLAlchemy 都有实际使用经历，"
+    "但缺少 LLM 应用经验，学历符合要求。",
+    "suggestions": [
+        {
+            "priority": "high",
+            "category": "量化",
+            "issue": "项目经历写「优化了接口性能」，没有给出优化前后的对比",
+            "advice": "补上具体指标：QPS、响应时间、错误率，至少给两个",
+            "example": "订单查询接口 P99 从 480ms 降到 120ms，QPS 由 300 提升至 1200",
+        },
+        {
+            "priority": "medium",
+            "category": "内容",
+            "issue": "两段实习都用「负责 XX 模块开发」开头，看不出你的独立贡献",
+            "advice": "改成「问题 - 做法 - 结果」的结构，交代清楚为什么这么做",
+            "example": "订单超时频发：引入延迟队列做超时关单，超时投诉下降 90%",
+        },
+        {
+            "priority": "low",
+            "category": "结构",
+            "issue": "缺少自我评价，简历结尾显得突兀",
+            "advice": "补两行，说明技术方向与求职意向，不要写「吃苦耐劳」这类空话",
+            "example": None,
+        },
+    ],
+}
+
 
 class AnalysisCreate(BaseModel):
     """提交分析时的请求体。
@@ -182,6 +230,17 @@ class AnalysisCreate(BaseModel):
         cleaned = value.strip()
         return cleaned or None
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "job_description": (
+                    "招聘 Python 后端工程师：熟悉 FastAPI / SQLAlchemy / MySQL，"
+                    "有 LLM 应用经验优先，本科及以上学历。"
+                )
+            }
+        }
+    )
+
 
 class AnalysisOut(BaseModel):
     """分析记录的完整出参。
@@ -204,7 +263,25 @@ class AnalysisOut(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
+            "example": {
+                "id": 12,
+                "resume_id": 2,
+                "status": "done",
+                "jd_text": "招聘 Python 后端工程师：熟悉 FastAPI / SQLAlchemy / MySQL…",
+                "match_score": 58,
+                "result": _RESULT_EXAMPLE,
+                "model_name": "deepseek-chat",
+                "prompt_version": "v1.0.0",
+                "error_message": None,
+                "created_at": "2026-11-08T09:14:02Z",
+                "started_at": "2026-11-08T09:14:03Z",
+                "finished_at": "2026-11-08T09:14:19Z",
+            }
+        },
+    )
 
     @field_validator("created_at", "started_at", "finished_at")
     @classmethod
@@ -237,6 +314,20 @@ class AnalysisListItem(BaseModel):
     summary: str | None = None
     created_at: datetime
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "id": 12,
+                "resume_id": 2,
+                "status": "done",
+                "match_score": 58,
+                "overall_score": 62,
+                "summary": "后端技术栈与目标岗位基本匹配；项目描述偏重功能罗列，缺少量化结果。",
+                "created_at": "2026-11-08T09:14:02Z",
+            }
+        }
+    )
+
     @field_validator("created_at")
     @classmethod
     def _ensure_utc(cls, value: datetime) -> datetime:
@@ -252,3 +343,33 @@ class AnalysisListOut(BaseModel):
     page: int
     size: int
     items: list[AnalysisListItem]
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "total": 3,
+                "page": 1,
+                "size": 20,
+                "items": [
+                    {
+                        "id": 12,
+                        "resume_id": 2,
+                        "status": "done",
+                        "match_score": 58,
+                        "overall_score": 62,
+                        "summary": "后端技术栈与目标岗位基本匹配；项目描述偏重功能罗列，缺少量化结果。",
+                        "created_at": "2026-11-08T09:14:02Z",
+                    },
+                    {
+                        "id": 11,
+                        "resume_id": 2,
+                        "status": "failed",
+                        "match_score": None,
+                        "overall_score": None,
+                        "summary": None,
+                        "created_at": "2026-11-08T08:02:11Z",
+                    },
+                ],
+            }
+        }
+    )

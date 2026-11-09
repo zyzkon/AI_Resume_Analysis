@@ -54,6 +54,28 @@ class ResumeDetailOut(ResumeOut):
 
     raw_text: str = Field(description="解析出的正文，只返回前 500 字")
 
+    # 覆盖父类的 example：详情比摘要多一个字段，直接复用父类那份会漏掉 raw_text，
+    # 让人误以为详情接口不返回正文
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
+            "example": {
+                "id": 1,
+                "original_filename": "张三-Java后端.pdf",
+                "file_size": 284517,
+                "char_count": 3821,
+                "created_at": "2026-11-05T08:21:00Z",
+                "raw_text": (
+                    "张三 | Java 后端工程师\n"
+                    "138-0000-0000 | zhangsan@example.com\n\n"
+                    "教育背景\n2016.09 - 2020.06  某某大学  计算机科学与技术  本科\n\n"
+                    "工作经历\n2020.07 - 至今  某某科技  后端开发工程师\n"
+                    "- 负责订单系统的接口开发与性能优化\n…"
+                ),
+            }
+        },
+    )
+
     @field_serializer("raw_text")
     def _truncate(self, value: str, _info) -> str:
         """序列化时才截断，校验阶段保留完整值。
@@ -79,3 +101,29 @@ class ResumeListOut(BaseModel):
     page: int
     size: int
     items: list[ResumeOut]
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "total": 2,
+                "page": 1,
+                "size": 20,
+                "items": [
+                    {
+                        "id": 2,
+                        "original_filename": "李四-前端工程师.docx",
+                        "file_size": 51203,
+                        "char_count": 2140,
+                        "created_at": "2026-11-06T02:15:30Z",
+                    },
+                    {
+                        "id": 1,
+                        "original_filename": "张三-Java后端.pdf",
+                        "file_size": 284517,
+                        "char_count": 3821,
+                        "created_at": "2026-11-05T08:21:00Z",
+                    },
+                ],
+            }
+        }
+    )

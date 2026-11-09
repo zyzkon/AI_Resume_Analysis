@@ -21,19 +21,28 @@ from app.models.user import User
 #   1. 告诉 OpenAPI 文档"本项目用 OAuth2 密码模式"，Swagger UI 上才会出现 Authorize 按钮；
 #   2. tokenUrl 指定前端该往哪个地址 POST 用户名密码去换 token，
 #      这里的 "/auth/token" 必须和 auth 路由里实际注册的路径完全一致，否则点 Authorize 会 404；
-#   3. auto_error=True（默认）时，请求头里没有 Authorization 就自动抛 401，
-#      不用我们手写"没带 token"的判断。
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+#   3. 从 Authorization 请求头里把 token 抽出来，交给下面的函数处理。
+#
+# auto_error=False 是关键：默认值 True 会让 FastAPI 在"没带 Authorization 头"时
+# 自己抛一个 401，文案是写死的英文 "Not authenticated"。
+# 这个项目其余所有错误都是中文，只有这一条是英文，前端做错误提示时还得单独判一次。
+# 关掉它，把"没带 token"也纳入下面的统一分支，整个接口的 401 文案就一致了。
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token", auto_error=False)
 
 
 def get_current_user(
-    token: str = Depends(oauth2_scheme),
+    token: str | None = Depends(oauth2_scheme),
     db: Session = Depends(get_db),
 ) -> User:
     """从 Authorization 请求头解析出当前用户，解析不出来就 401。
 
     注意这个函数不返回 None：要么返回 User，要么直接抛异常中断请求。
     所以路由里拿到的 current_user 一定非空，不需要写 if current_user is None。
+
+    401 一共有三种文案，全部由这里产生：
+    - 未提供身份凭证      -> 请求头里根本没有 Authorization
+    - 无效的凭证          -> 签名不对、格式非法、sub 缺失或不是数字
+    - 登录已过期，请重新登录 -> 签名有效但 exp 已过
     """
 
     # 统一的 401 响应。带 WWW-Authenticate: Bearer 是 RFC 6750 的硬性要求，
@@ -41,9 +50,21 @@ def get_current_user(
     # 故意不区分"token 过期"和"签名不对"，避免给攻击者试探的信息。
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="无效的身份凭证",
+        # 和 security.py 里 TokenError 的文案保持一致（"无效的凭证"）。
+        # 用同一个字符串，是为了让"token 签名不对"和"sub 缺失"在客户端看来
+        # 是完全相同的失败 —— 否则攻击者能靠文案差异判断自己伪造到了哪一步
+        detail="无效的凭证",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+    # 第零步：压根没带 token。
+    # oauth2_scheme 关掉了 auto_error，所以这里拿到的是 None 而不是被框架提前拦住
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="未提供身份凭证",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     # 第一步：验签 + 检查过期。security.py 把 PyJWT 的一堆异常
     # 收敛成了 TokenError 一种，这里只捕获它。

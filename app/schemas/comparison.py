@@ -11,7 +11,7 @@ analysis.py 描述"模型输出什么"，字段由 Prompt 决定；
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.analysis import Category, Priority
 
@@ -113,6 +113,96 @@ class CompareOut(BaseModel):
     suggestions: list[SuggestionDelta]
     stats: CompareStats
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "resume_id": 2,
+                "base": {
+                    "id": 12,
+                    "created_at": "2026-11-07T10:02:11Z",
+                    "model_name": "deepseek-chat",
+                    "prompt_version": "v1.0.0",
+                    "jd_text": "招聘 Python 后端工程师：熟悉 FastAPI / SQLAlchemy / MySQL…",
+                    "overall_score": 62,
+                    "match_score": 58,
+                    "suggestion_count": 3,
+                },
+                "target": {
+                    "id": 14,
+                    "created_at": "2026-11-08T09:14:02Z",
+                    "model_name": "deepseek-chat",
+                    "prompt_version": "v1.0.0",
+                    "jd_text": "招聘 Python 后端工程师：熟悉 FastAPI / SQLAlchemy / MySQL…",
+                    "overall_score": 71,
+                    "match_score": 66,
+                    "suggestion_count": 3,
+                },
+                "scores": [
+                    {
+                        "key": "overall_score",
+                        "label": "综合评分",
+                        "before": 62,
+                        "after": 71,
+                        "delta": 9,
+                    },
+                    {
+                        "key": "match_score",
+                        "label": "岗位匹配度",
+                        "before": 58,
+                        "after": 66,
+                        "delta": 8,
+                    },
+                ],
+                "sections": [
+                    {"name": "基本信息", "before": True, "after": True, "change": "unchanged"},
+                    # 上次没检查这个栏目 -> 这次检查了，算 improved
+                    {"name": "自我评价", "before": False, "after": True, "change": "improved"},
+                ],
+                "suggestions": [
+                    # persisted：改了措辞但相似度 0.788，仍判成同一个问题
+                    {
+                        "change": "persisted",
+                        "category": "量化",
+                        "issue": "项目经历中缺乏量化数据，无法衡量成果",
+                        "advice": "补上具体指标：QPS、响应时间、错误率，至少给两个",
+                        "example": "订单查询接口 P99 从 480ms 降到 120ms，QPS 由 300 提升至 1200",
+                        "priority_before": "high",
+                        "priority_after": "high",
+                        "similarity": 0.788,
+                    },
+                    {
+                        "change": "resolved",
+                        "category": "结构",
+                        "issue": "缺少自我评价，简历结尾显得突兀",
+                        "advice": "补两行，说明技术方向与求职意向",
+                        "example": None,
+                        "priority_before": "low",
+                        "priority_after": None,
+                        "similarity": 0.0,
+                    },
+                    {
+                        "change": "new",
+                        "category": "表达",
+                        "issue": "自我评价写了「吃苦耐劳」，与岗位无关",
+                        "advice": "换成技术方向与求职意向，别用形容词堆砌",
+                        "example": None,
+                        "priority_before": None,
+                        "priority_after": "medium",
+                        "similarity": 0.0,
+                    },
+                ],
+                "stats": {
+                    "overall_delta": 9,
+                    "match_delta": 8,
+                    "new_issues": 1,
+                    "resolved_issues": 1,
+                    "persisted_issues": 1,
+                    "verdict": "综合评分上升 9 分，解决 1 个问题，仍有 1 个旧问题未处理。",
+                },
+            }
+        }
+    )
+
 
 class TrendPoint(BaseModel):
     """走势图上的一个点。字段刻意保持扁平，前端不用再嵌套取值。"""
@@ -144,3 +234,33 @@ class TrendOut(BaseModel):
     points: list[TrendPoint]
     best_analysis_id: int | None = Field(default=None, description="综合评分最高的一次")
     latest_analysis_id: int | None = Field(default=None, description="最近完成的一次")
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "resume_id": 2,
+                "points": [
+                    {
+                        "analysis_id": 12,
+                        "created_at": "2026-11-07T10:02:11Z",
+                        "overall_score": 62,
+                        "match_score": 58,
+                        "suggestion_count": 3,
+                        "model_name": "deepseek-chat",
+                        "prompt_version": "v1.0.0",
+                    },
+                    {
+                        "analysis_id": 14,
+                        "created_at": "2026-11-08T09:14:02Z",
+                        "overall_score": 71,
+                        "match_score": 66,
+                        "suggestion_count": 3,
+                        "model_name": "deepseek-chat",
+                        "prompt_version": "v1.0.0",
+                    },
+                ],
+                "best_analysis_id": 14,
+                "latest_analysis_id": 14,
+            }
+        }
+    )

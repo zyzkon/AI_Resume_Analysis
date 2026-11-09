@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
+from app.api.openapi import AUTH_REQUIRED, CONFLICT_EMAIL, FORBIDDEN, INVALID_CREDENTIALS
 from app.core.config import settings
 from app.core.security import create_access_token, hash_password, verify_password
 from app.db.session import get_db
@@ -84,7 +85,14 @@ def _issue_token(user: User) -> Token:
     response_model=UserOut,
     status_code=status.HTTP_201_CREATED,
     summary="注册",
-    description="注册成功后直接返回用户信息，不自动登录、不下发 token。",
+    description=(
+        "注册成功后直接返回用户信息，**不自动登录、不下发 token**，需要再调一次登录接口。\n\n"
+        "邮箱重复由数据库唯一索引判定 —— 不是先查后插，那样在「查完还没插」的间隙里"
+        "两个并发请求会同时通过检查。冲突时返回 409。\n\n"
+        "密码按 **UTF-8 字节数**限制在 72 以内（不是字符数）：bcrypt 只处理前 72 字节，"
+        "超出的部分会被静默截断，等于密码后半段没生效。"
+    ),
+    responses={409: CONFLICT_EMAIL},
 )
 def register(payload: UserRegister, db: Session = Depends(get_db)) -> User:
     user = User(
@@ -118,9 +126,13 @@ def register(payload: UserRegister, db: Session = Depends(get_db)) -> User:
     response_model=Token,
     summary="登录（表单，供 Swagger 使用）",
     description=(
-        "接收 application/x-www-form-urlencoded，"
-        "**username 字段要填邮箱**。这是 OAuth2 规定的字段名，改不了。"
+        "接收 `application/x-www-form-urlencoded`，**`username` 字段要填邮箱** —— "
+        "这是 OAuth2 规范规定的字段名，改不了。\n\n"
+        "和 `POST /auth/login` 返回的 token 完全等价，只是请求格式不同："
+        "这个入口是为了让 Swagger 的 **Authorize** 按钮能工作，"
+        "点它的时候浏览器发的是表单而不是 JSON。"
     ),
+    responses={401: INVALID_CREDENTIALS, 403: FORBIDDEN},
 )
 def login_for_access_token(
     form_data: OAuth2PasswordRequestForm = Depends(),
@@ -134,6 +146,15 @@ def login_for_access_token(
     "/login",
     response_model=Token,
     summary="登录（JSON，供前端使用）",
+    description=(
+        "接收 JSON，给前端用的入口。\n\n"
+        "邮箱不存在、密码错误这两种情况返回**完全相同**的 401 和文案，"
+        "响应耗时也刻意对齐（用户不存在时照样跑一次 bcrypt），"
+        "目的是不泄露「这个邮箱有没有注册过」。\n\n"
+        "登录**不校验密码强度**：老用户的密码可能是早期规则下设的，"
+        "在登录口加长度限制会让他们直接登不进来。强度只在注册时把关。"
+    ),
+    responses={401: INVALID_CREDENTIALS, 403: FORBIDDEN},
 )
 def login(payload: UserLogin, db: Session = Depends(get_db)) -> Token:
     user = _authenticate(db, payload.email, payload.password)
@@ -144,6 +165,15 @@ def login(payload: UserLogin, db: Session = Depends(get_db)) -> Token:
     "/me",
     response_model=UserOut,
     summary="获取当前登录用户",
+    description=(
+        "把请求头里的 token 解析成用户对象。\n\n"
+        "前端可以用它校验本地存的 token 还有效没有：拿到 401 就该清掉本地凭证、"
+        "跳回登录页，而不是等某个业务接口莫名其妙失败。\n\n"
+        "每次请求都会查一次数据库（走主键索引，成本极低）。"
+        "不这么做的话，token 一旦签发就无法撤销 —— 用户被禁用、账号被删，"
+        "只要旧 token 没过期就还能继续用。"
+    ),
+    responses=AUTH_REQUIRED,
 )
 def read_me(current_user: User = Depends(get_current_user)) -> User:
     # 不需要再查库：get_current_user 已经从数据库把整行取出来了。

@@ -14,6 +14,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
+from app.api.openapi import (
+    AUTH_REQUIRED,
+    BAD_REQUEST_UPLOAD,
+    OWNED_RESUME,
+    SAVE_FAILED,
+    TOO_LARGE,
+    UNSUPPORTED_MEDIA,
+)
 from app.core.config import settings
 from app.db.session import get_db
 from app.models.resume import Resume
@@ -51,7 +59,25 @@ def _remove_file(stored_filename: str) -> None:
     response_model=ResumeOut,
     status_code=status.HTTP_201_CREATED,
     summary="上传简历并解析",
-    description="支持 PDF 和 DOCX，最大 5MB。上传后立刻解析出正文存库。",
+    description=(
+        "支持 **PDF** 和 **DOCX**，默认上限 5MB（`MAX_UPLOAD_MB`）。"
+        "上传后立刻解析出正文存库，所以这个接口是同步的、可能需要一两秒。\n\n"
+        "校验顺序如下，任何一步失败都会把已落盘的文件删掉：\n\n"
+        "1. **扩展名**（415）—— 纯用户输入，不可信\n"
+        "2. **大小**（413）—— 边读边累加，超限立刻中断，不把整个文件读进内存\n"
+        "3. **文件头魔数**（415）—— 有人把 .exe 改名成 .pdf，扩展名检查完全拦不住\n"
+        "4. **解析**（400）—— 扫描件、损坏文件、加密 PDF 都在这里失败\n"
+        "5. **正文长度**（400）—— 超过 MySQL TEXT 的余量上限就拒绝\n\n"
+        "落盘时用 UUID 重命名，不保留原始文件名：原名里可能有 `../` 造成路径穿越，"
+        "也可能和别人的文件同名直接覆盖。原文件名只存在数据库里用于展示。"
+    ),
+    responses={
+        **AUTH_REQUIRED,
+        400: BAD_REQUEST_UPLOAD,
+        413: TOO_LARGE,
+        415: UNSUPPORTED_MEDIA,
+        500: SAVE_FAILED,
+    },
 )
 def upload_resume(
     file: UploadFile = File(..., description="简历文件，.pdf 或 .docx"),
@@ -140,7 +166,19 @@ def upload_resume(
     return resume
 
 
-@router.get("", response_model=ResumeListOut, summary="我的简历列表")
+@router.get(
+    "",
+    response_model=ResumeListOut,
+    summary="我的简历列表",
+    description=(
+        "按创建时间**倒序**分页返回当前用户名的简历。\n\n"
+        "**不包含正文**：一份简历几千字，20 条就是几百 KB 的 JSON，"
+        "列表页只想回答「哪份、多大、什么时候传的」。需要正文调详情接口。\n\n"
+        "排序键是 `(created_at DESC, id DESC)` —— `created_at` 只精确到秒，"
+        "同一秒内连传两份时单靠它排序不稳定，分页会漏行或重复行。"
+    ),
+    responses=AUTH_REQUIRED,
+)
 def list_resumes(
     page: int = Query(1, ge=1, description="页码，从 1 开始"),
     size: int = Query(20, ge=1, le=100, description="每页条数，最大 100"),
@@ -177,7 +215,18 @@ def list_resumes(
     )
 
 
-@router.get("/{resume_id}", response_model=ResumeDetailOut, summary="简历详情")
+@router.get(
+    "/{resume_id}",
+    response_model=ResumeDetailOut,
+    summary="简历详情",
+    description=(
+        "比列表多返回 `raw_text`，但**只截前 500 字**。\n\n"
+        "截断发生在序列化层而不是查询层：字段声明成 `str` 却只装一部分内容，"
+        "读者容易误以为这就是全文；用序列化器表达「出参只给预览」语义更准确，"
+        "也不会影响对象本身（详情逻辑将来要拿全文时不用再查一次库）。"
+    ),
+    responses=OWNED_RESUME,
+)
 def get_resume(
     resume_id: int,
     db: Session = Depends(get_db),
@@ -204,6 +253,14 @@ def get_resume(
     "/{resume_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="删除简历",
+    description=(
+        "同时删除数据库记录和磁盘文件，成功返回 **204**（无响应体）。\n\n"
+        "删除顺序是**先删库、再删文件**。反过来如果文件删了但 commit 失败，"
+        "库里会留一条指向不存在文件的记录，点开详情就 500；"
+        "而现在的顺序出错顶多留一个孤儿文件，不影响数据一致性。\n\n"
+        "简历下的分析记录由数据库外键 `ON DELETE CASCADE` 一起清掉。"
+    ),
+    responses=OWNED_RESUME,
 )
 def delete_resume(
     resume_id: int,

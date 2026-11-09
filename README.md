@@ -184,6 +184,7 @@ app/
 ├── main.py               FastAPI 实例、中间件、路由注册
 ├── api/
 │   ├── deps.py           get_current_user：JWT -> User
+│   ├── openapi.py        tag 说明与标准错误响应（文档素材，不含逻辑）
 │   └── routes/           auth / resumes / analyses 三组端点
 ├── core/
 │   ├── config.py         Settings，环境变量的唯一来源
@@ -193,6 +194,7 @@ app/
 │   └── init_db.py        建表脚本
 ├── models/               SQLAlchemy 表定义
 ├── schemas/              Pydantic 入参 / 出参
+│   ├── system.py         健康检查出参
 │   └── comparison.py     对比与走势的出参模型
 ├── services/             业务逻辑，不认识 FastAPI 也不认识 Celery
 │   ├── parser.py         PDF / DOCX -> 纯文本
@@ -224,6 +226,10 @@ app/
 **对比不落库**：`trend` 和 `compare` 完全由已有的 `result` JSON 现算，不新增表、不缓存。代价是每次请求都要把 JSON 反序列化再校验一遍，收益是改算法时历史数据自动跟上 —— 如果把 diff 结果存表，算法一升级，旧记录就永远是新旧混杂的。目前一份简历几十次分析的规模，现算的开销可以忽略。
 
 **为什么 409 而不是 400**：拿 `pending` 的分析做对比，请求本身没写错，是资源当前状态不允许这个操作。前端拿到 409 应该提示「等分析跑完再看」，拿到 400 则会以为参数填错了。
+
+**错误码进文档**：FastAPI 默认只把成功码和 422 写进 OpenAPI，客户端想知道「什么时候返回 409」只能翻源码。`api/openapi.py` 把每个错误码的描述和响应示例集中定义成常量，路由里 `responses={**AUTH_REQUIRED, 404: NOT_FOUND_RESUME}` 引用 —— 14 个端点共用一份措辞，不会出现「这个接口写『无效凭证』、那个写『认证失败』」的漂移。422 刻意不覆盖，框架自动生成的那份带着字段级的 `loc` / `msg` / `type`，比手写的示例信息量大。
+
+**401 文案统一在中文**：`OAuth2PasswordBearer` 默认会在「没带 Authorization 头」时自己抛 401，文案是写死的英文 `Not authenticated`。传 `auto_error=False` 把这一步收回 `get_current_user` 里，全站 401 只有三种文案（未提供身份凭证 / 无效的凭证 / 登录已过期），前端不用为一条英文单独写判断。
 
 ## 代码检查
 

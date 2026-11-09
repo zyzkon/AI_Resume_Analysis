@@ -18,6 +18,17 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
+from app.api.openapi import (
+    AUTH_REQUIRED,
+    BAD_REQUEST_EMPTY_TEXT,
+    BAD_REQUEST_SAME_ID,
+    CONFLICT_UNFINISHED,
+    INTERNAL,
+    NOT_FOUND_ANALYSIS,
+    NOT_FOUND_RESUME,
+    OWNED_RESUME,
+    QUEUE_UNAVAILABLE,
+)
 from app.db.session import get_db
 from app.models.analysis import Analysis, AnalysisStatus
 from app.models.resume import Resume
@@ -131,10 +142,21 @@ def _to_brief(analysis: Analysis, result: AnalysisResult) -> AnalysisBrief:
     status_code=status.HTTP_202_ACCEPTED,
     summary="提交分析（异步）",
     description=(
-        "建一条 pending 记录后立刻返回，实际的模型调用在后台 worker 里执行。\n\n"
-        "拿返回的 id 轮询 `GET /analyses/{id}`，status 会依次变成 "
-        "`pending` -> `running` -> `done`（或 `failed`，此时 error_message 有原因）。"
+        "建一条 `pending` 记录后**立刻返回 202**，实际的模型调用在后台 worker 里执行。\n\n"
+        "拿返回的 `id` 轮询 `GET /analyses/{id}`，`status` 会依次变成 "
+        "`pending` -> `running` -> `done`（或 `failed`，此时 `error_message` 有原因）。\n\n"
+        "**请求体可以整个不传**：不传 `job_description` 就按通用技术岗标准评估，"
+        "`match_score` 照样有值，只是缺少针对性。\n\n"
+        "先落库再投递，顺序不能反 —— 反过来的话 worker 可能在记录还不存在时开始跑，"
+        "查不到东西直接结束，用户会看到一条永远呈 `pending` 的分析。"
+        "投递失败时记录会被标成 `failed` 并写明原因，接口返回 503。"
     ),
+    responses={
+        **AUTH_REQUIRED,
+        400: BAD_REQUEST_EMPTY_TEXT,
+        404: NOT_FOUND_RESUME,
+        503: QUEUE_UNAVAILABLE,
+    },
 )
 def create_analysis(
     resume_id: int,
@@ -195,7 +217,19 @@ def create_analysis(
 @analysis_router.get(
     "/{analysis_id}",
     response_model=AnalysisOut,
-    summary="查询分析结果",
+    summary="查询分析结果（轮询用）",
+    description=(
+        "前端轮询这个接口直到 `status` 变成终态：\n\n"
+        "| status | result | error_message | 含义 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| `pending` | null | null | 已入库，等 worker 领走 |\n"
+        "| `running` | null | null | worker 正在调模型 |\n"
+        "| `done` | 完整结果 | null | 成功 |\n"
+        "| `failed` | null | 失败原因 | 模型报错、超时或投递失败 |\n\n"
+        "`created_at` 与 `started_at` 之差就是排队耗时。"
+        "`started_at` 是 null 说明从来没有 worker 领走过它 —— 多半是 worker 没启动。"
+    ),
+    responses={**AUTH_REQUIRED, 404: NOT_FOUND_ANALYSIS},
 )
 def get_analysis(
     analysis_id: int,
@@ -217,6 +251,14 @@ def get_analysis(
     "/{resume_id}/analyses",
     response_model=AnalysisListOut,
     summary="某份简历的分析历史",
+    description=(
+        "按提交时间倒序分页返回，**包含所有状态**（pending / running / done / failed）—— "
+        "失败记录也要能看到，否则用户会以为「我点了但接口没生效」。\n\n"
+        "**不返回 `result` 全文**：一次分析的结果 JSON 有一两千字，"
+        "20 条就是几十 KB，而列表页只想回答「哪次、几分、什么状态」。"
+        "`overall_score` 和 `summary` 是从 `result` 里挑出来的两个摘要字段。"
+    ),
+    responses=OWNED_RESUME,
 )
 def list_analyses(
     resume_id: int,
@@ -259,8 +301,11 @@ def list_analyses(
     description=(
         "按时间正序返回这份简历所有**已完成**分析的关键指标，用于画折线图。\n\n"
         "只返回最近 `limit` 次；正在排队和失败的分析不进图 —— "
-        "它们没有分数，混进去会变成断点。"
+        "它们没有分数，混进去会变成断点。\n\n"
+        "`points` 按时间**正序**，`best_analysis_id` / `latest_analysis_id` "
+        "由后端算好，前端不用为了一个徽标再遍历一遍列表。"
     ),
+    responses={**OWNED_RESUME, 500: INTERNAL},
 )
 def analysis_trend(
     resume_id: int,
@@ -323,8 +368,16 @@ def analysis_trend(
         "拿同一份简历的两次**已完成**分析做差异对比：分数变化、栏目完整度变化，"
         "以及建议的新增 / 已解决 / 仍存在。\n\n"
         "建议之间用文本相似度匹配（阈值 0.55），所以「改了措辞的同一个问题」"
-        "会被认成仍存在，而不是变成一删一增。"
+        "会被认成仍存在，而不是变成一删一增。\n\n"
+        "**结果不落库**，每次请求从已有的 `result` JSON 现算。"
+        "存表的话旧记录会变成新旧算法混杂，反而没法解释历史上的差异是怎么来的。"
     ),
+    responses={
+        **OWNED_RESUME,
+        400: BAD_REQUEST_SAME_ID,
+        409: CONFLICT_UNFINISHED,
+        500: INTERNAL,
+    },
 )
 def compare_analyses(
     resume_id: int,
