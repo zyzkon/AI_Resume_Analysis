@@ -13,6 +13,7 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -26,7 +27,10 @@ from app.schemas.analysis import (
     AnalysisListItem,
     AnalysisListOut,
     AnalysisOut,
+    AnalysisResult,
 )
+from app.schemas.comparison import AnalysisBrief, CompareOut, TrendOut, TrendPoint
+from app.services.comparison import compare_results
 from app.services.prompts import PROMPT_VERSION
 from app.workers.tasks import run_analysis
 
@@ -77,6 +81,47 @@ def _to_list_item(analysis: Analysis) -> AnalysisListItem:
         overall_score=result.get("overall_score"),
         summary=result.get("summary"),
         created_at=analysis.created_at,
+    )
+
+
+def _load_result(analysis: Analysis) -> AnalysisResult:
+    """把 JSON 列读成 AnalysisResult，顺便当一次老数据的结构回归测试。
+
+    为什么要 try：表里可能躺着几个月前存下的 result，
+    当时 Prompt 的输出结构未必和现在一致。compare 和 trend 都要遍历多条，
+    一条坏数据就让整个接口 500 显然不合理，所以在这里统一转成带 id 的 500，
+    至少运维一眼能定位是哪条记录。
+
+    注意不能直接 `analysis.result` 当真值判断再 `.model_validate`：
+    result 列声明是 `dict | None`，静态检查看不出里面到底长什么样。
+    """
+    if not analysis.result:
+        raise HTTPException(
+            status_code=500,
+            detail=f"分析记录 {analysis.id} 没有结果数据",
+        )
+    try:
+        return AnalysisResult.model_validate(analysis.result)
+    except ValidationError as exc:
+        logger.warning("分析记录 %s 的结果结构已失效：%s", analysis.id, exc)
+        raise HTTPException(
+            status_code=500,
+            detail=f"分析记录 {analysis.id} 的结果数据已损坏，无法解析",
+        ) from exc
+
+
+def _to_brief(analysis: Analysis, result: AnalysisResult) -> AnalysisBrief:
+    """对比接口两侧的摘要。分数从校验过的 result 里取，不从冗余列取 ——
+    保证同一份响应内部两组数字不会互相矛盾。"""
+    return AnalysisBrief(
+        id=analysis.id,
+        created_at=analysis.created_at,
+        model_name=analysis.model_name,
+        prompt_version=analysis.prompt_version,
+        jd_text=analysis.jd_text,
+        overall_score=result.overall_score,
+        match_score=result.match_score,
+        suggestion_count=len(result.suggestions),
     )
 
 
@@ -204,4 +249,136 @@ def list_analyses(
         page=page,
         size=size,
         items=[_to_list_item(row) for row in rows],
+    )
+
+
+@router.get(
+    "/{resume_id}/analyses/trend",
+    response_model=TrendOut,
+    summary="分数走势",
+    description=(
+        "按时间正序返回这份简历所有**已完成**分析的关键指标，用于画折线图。\n\n"
+        "只返回最近 `limit` 次；正在排队和失败的分析不进图 —— "
+        "它们没有分数，混进去会变成断点。"
+    ),
+)
+def analysis_trend(
+    resume_id: int,
+    limit: int = Query(50, ge=1, le=200, description="最多返回多少个点，取最近的 N 次"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrendOut:
+    _get_own_resume(db, resume_id, current_user)
+
+    # 先按时间倒序取最近的 N 条，翻转成正序再返回。
+    # 如果直接 order_by 正序 + limit，拿到的是"最早的 N 条"，
+    # 数据一多就永远看不到最新的那次分析
+    rows = db.scalars(
+        select(Analysis)
+        .where(
+            Analysis.resume_id == resume_id,
+            Analysis.user_id == current_user.id,
+            # 只要完成且有结果的。status 和 result 两个条件都写：
+            # 理论上 done 必有 result，但历史数据或手动改库都可能破坏这个不变量
+            Analysis.status == AnalysisStatus.DONE,
+            Analysis.result.is_not(None),
+        )
+        .order_by(Analysis.created_at.desc(), Analysis.id.desc())
+        .limit(limit)
+    ).all()
+
+    points: list[TrendPoint] = []
+    for row in reversed(rows):
+        result = _load_result(row)
+        points.append(
+            TrendPoint(
+                analysis_id=row.id,
+                created_at=row.created_at,
+                overall_score=result.overall_score,
+                match_score=result.match_score,
+                suggestion_count=len(result.suggestions),
+                model_name=row.model_name,
+                prompt_version=row.prompt_version,
+            )
+        )
+
+    # best / latest 由后端算好，省得前端为了一个徽标再遍历一遍。
+    # points 已按时间正序，所以最后一个就是最新的一次
+    best = max(points, key=lambda point: point.overall_score) if points else None
+    latest = points[-1] if points else None
+
+    return TrendOut(
+        resume_id=resume_id,
+        points=points,
+        best_analysis_id=best.analysis_id if best else None,
+        latest_analysis_id=latest.analysis_id if latest else None,
+    )
+
+
+@router.get(
+    "/{resume_id}/analyses/compare",
+    response_model=CompareOut,
+    summary="对比两次分析",
+    description=(
+        "拿同一份简历的两次**已完成**分析做差异对比：分数变化、栏目完整度变化，"
+        "以及建议的新增 / 已解决 / 仍存在。\n\n"
+        "建议之间用文本相似度匹配（阈值 0.55），所以「改了措辞的同一个问题」"
+        "会被认成仍存在，而不是变成一删一增。"
+    ),
+)
+def compare_analyses(
+    resume_id: int,
+    base_id: int = Query(..., description="基准分析（较早的一次）的 id"),
+    target_id: int = Query(..., description="对比分析（较新的一次）的 id"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> CompareOut:
+    _get_own_resume(db, resume_id, current_user)
+
+    if base_id == target_id:
+        raise HTTPException(status_code=400, detail="对比的两个分析 id 不能相同")
+
+    # 一次查两条，条件里同时带上 resume_id 和 user_id。
+    # 只写 id.in_() 的话，A 用户拿 B 用户的分析 id 也能查出来
+    rows = db.scalars(
+        select(Analysis).where(
+            Analysis.id.in_([base_id, target_id]),
+            Analysis.resume_id == resume_id,
+            Analysis.user_id == current_user.id,
+        )
+    ).all()
+    found = {row.id: row for row in rows}
+
+    selected: dict[str, Analysis] = {}
+    for label, analysis_id in (("base_id", base_id), ("target_id", target_id)):
+        row = found.get(analysis_id)
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"分析记录 {analysis_id} 不存在，或不属于这份简历",
+            )
+        if row.status != AnalysisStatus.DONE or not row.result:
+            # 409 而不是 400：请求本身没写错，是资源当前状态不允许这个操作。
+            # 前端拿到这个错应该提示"等分析跑完再看"，而不是"参数填错了"
+            raise HTTPException(
+                status_code=409,
+                detail=f"分析记录 {analysis_id} 尚未完成（status={row.status}），无法对比",
+            )
+        selected[label] = row
+
+    base = selected["base_id"]
+    target = selected["target_id"]
+    base_result = _load_result(base)
+    target_result = _load_result(target)
+
+    diff = compare_results(base_result, target_result)
+
+    return CompareOut(
+        resume_id=resume_id,
+        base=_to_brief(base, base_result),
+        target=_to_brief(target, target_result),
+        scores=diff.scores,
+        sections=diff.sections,
+        suggestions=diff.suggestions,
+        stats=diff.stats,
     )

@@ -115,6 +115,11 @@ Content-Type: application/json
 }
 
 > {%
+    // 上一次的 id 留作对比基准（第 11 步用）；第一次跑时它是空的
+    const previous = client.global.get("analysis_id");
+    if (previous) {
+        client.global.set("baseline_id", previous);
+    }
     client.global.set("analysis_id", response.body.id);
     client.log("id = " + response.body.id + "，status = " + response.body.status);
 %}
@@ -125,6 +130,10 @@ POST {{host}}/resumes/{{resume_id}}/analyses
 Authorization: Bearer {{token}}
 
 > {%
+    const previous = client.global.get("analysis_id");
+    if (previous) {
+        client.global.set("baseline_id", previous);
+    }
     client.global.set("analysis_id", response.body.id);
 %}
 
@@ -141,6 +150,37 @@ Authorization: Bearer {{token}}
 # status 可能是 running / done / failed；failed 的记录里 error_message 有原因。
 GET {{host}}/resumes/{{resume_id}}/analyses?page=1&size=20
 Authorization: Bearer {{token}}
+
+###
+# 10. 分数走势（折线图的数据源）
+# 只含已完成（done）的分析，按时间正序；pending / failed 不进图。
+# best_analysis_id / latest_analysis_id 由后端算好，前端不用再遍历。
+# limit 限的是"最近 N 次"，不是"最早 N 次"
+GET {{host}}/resumes/{{resume_id}}/analyses/trend?limit=50
+Authorization: Bearer {{token}}
+
+###
+# 11. 对比两次分析
+# base_id 是基准（较早的那次），target_id 是对比（较新那次），两个都必须是 done。
+# 建议会被分成三类：
+#   persisted 仍存在（上次的建议没落地，最该优先看）
+#   new       新增
+#   resolved  已解决
+# 匹配靠文本相似度（阈值 0.55），所以"改了措辞的同一个问题"会认成仍存在。
+# 前置条件：baseline_id 要有值。先跑两次第 7 步，它才会被写进去
+GET {{host}}/resumes/{{resume_id}}/analyses/compare?base_id={{baseline_id}}&target_id={{analysis_id}}
+Authorization: Bearer {{token}}
+
+###
+# 11b. 对比两次分析的错误分支演示
+# 400：两个 id 相同
+GET {{host}}/resumes/{{resume_id}}/analyses/compare?base_id=2&target_id=2
+Authorization: Bearer {{token}}
+
+###
+# 409：拿未完成的分析做对比（把 id 换成历史上 failed / pending 的那条）
+# GET {{host}}/resumes/{{resume_id}}/analyses/compare?base_id=2&target_id=5
+# Authorization: Bearer {{token}}
 
 ###
 # ---------------- 以下是错误分支演示，看懂返回码即可 ----------------
