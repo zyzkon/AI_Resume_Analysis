@@ -1,11 +1,12 @@
-"""Celery 任务层：只负责"进程生命周期"，业务逻辑在 services/analysis.py。
+"""Celery 任务层：只负责"进程生命周期"，业务逻辑在 services/ 下。
 
-这里剩下的三件事，特征都是"只有跑在 Celery 里才存在"：
+这里剩下的几件事，特征都是"只有跑在 Celery 里才存在"：
 1. 开 Session / 关 Session —— 路由有 Depends 帮忙，任务里没有
 2. 捕获 SoftTimeLimitExceeded —— 这是 Celery 的信号，业务层不该认识它
 3. 未预期异常记日志后重新抛出 —— 让 Celery 把任务标成 FAILURE，监控才能看见
+4. 定时任务注册 —— beat 调度表引用的任务名必须在这里存在，否则发出去也没人认
 
-业务逻辑（幂等判断、标 running、调模型、写回结果）全在 execute_analysis 里。
+业务逻辑（幂等判断、标 running、调模型、写回结果、清理僵尸记录）全在 services 里。
 这样写脚本批量重跑、或者写单元测试时，不必启动 Redis 和 worker。
 
 和路由层最重要的区别：Session 必须自己开关。
@@ -20,7 +21,13 @@ from celery.exceptions import SoftTimeLimitExceeded
 
 from app.db.session import SessionLocal
 from app.services.analysis import execute_analysis, mark_failed
-from app.workers.celery_app import SOFT_TIME_LIMIT, celery_app
+from app.services.maintenance import reap_stuck
+from app.workers.celery_app import (
+    SOFT_TIME_LIMIT,
+    STUCK_PENDING_SECONDS,
+    STUCK_RUNNING_SECONDS,
+    celery_app,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,4 +79,30 @@ def run_analysis(self, analysis_id: int) -> str:
 
     finally:
         # worker 是常驻进程，不 close 就是慢性连接泄漏
+        db.close()
+
+
+@celery_app.task(
+    name="analysis.reap_stuck",
+    ignore_result=True,
+)
+def reap_stuck_analyses() -> str:
+    """定时清理僵尸记录，由 beat 每 5 分钟投递一次（调度表在 celery_app.beat_schedule）。
+
+    不加 bind=True：这个任务不需要 self —— 它不读 soft_time_limit、不重试，
+    自身耗时也就一条 UPDATE 的功夫，用不上超时信号。
+
+    也不吞异常：数据库连不上就让它抛，Celery 记成 FAILURE，
+    下一轮 beat 自然还会再试。这里"静默成功"比"报错"危险得多 ——
+    清理器坏了却没人知道，僵尸记录会无声地堆积起来。
+    """
+    db = SessionLocal()
+    try:
+        result = reap_stuck(
+            db,
+            running_seconds=STUCK_RUNNING_SECONDS,
+            pending_seconds=STUCK_PENDING_SECONDS,
+        )
+        return f"running={result.running} pending={result.pending}"
+    finally:
         db.close()

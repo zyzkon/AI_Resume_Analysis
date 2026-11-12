@@ -24,6 +24,20 @@ _LLM_BUDGET = int(settings.LLM_TIMEOUT * (settings.LLM_MAX_RETRIES + 1))
 SOFT_TIME_LIMIT = _LLM_BUDGET + 30
 HARD_TIME_LIMIT = SOFT_TIME_LIMIT + 30
 
+# ---- 僵尸任务清理的阈值 ----
+# 这些值都从 HARD_TIME_LIMIT 推导，不写进 .env：它们和超时是硬绑定关系，
+# 调大 LLM_TIMEOUT 却忘了同步调大这里，清理任务就会开始误杀还在正常跑的分析。
+#
+# running 判定必须明显大于硬超时。任务被杀的瞬间进程就没了，记录却留在 running，
+# 得等别人来收拾；但"已死"的结论要等得足够久，给"进程被杀 -> visibility_timeout
+# 重投 -> 重新跑一遍"留出窗口（+120 秒）
+STUCK_RUNNING_SECONDS = HARD_TIME_LIMIT + 120
+# pending 给足一小时：worker 暂时没起、或者队列里排着别的长任务，都不该算死。
+# 超过一小时还没被任何人领走，基本只剩"消息丢了"一种解释
+STUCK_PENDING_SECONDS = 3600
+# 清理频率。它就是一条带索引条件的 UPDATE，5 分钟一次够快也够便宜
+REAP_INTERVAL_SECONDS = 300.0
+
 celery_app = Celery(
     "resume_analyzer",
     # broker 和 backend 用同一个 Redis 实例、同一个 db：
@@ -79,6 +93,19 @@ celery_app.conf.update(
     # 结果不写 backend，"开始执行"这个状态也就没地方存。
     # 这不算损失 —— 任务进行到哪一步，MySQL 的 status 列（pending/running/done/failed）
     # 本来就是唯一事实来源，比 Redis 里那份更可靠
+
+    # ---- 定时任务 ----
+    # beat 只负责"到点往队列里塞一条消息"，实际执行还是在 worker 里。
+    # 所以它需要单独一个进程（celery beat），或者开发期用 worker -B 内嵌。
+    #
+    # 内嵌 -B 只适合单机：多个 worker 各带一个 beat，同一个任务会被调度多次。
+    # 生产上必须只跑一个 beat 进程
+    beat_schedule={
+        "reap-stuck-analyses": {
+            "task": "analysis.reap_stuck",
+            "schedule": REAP_INTERVAL_SECONDS,
+        },
+    },
 )
 
 

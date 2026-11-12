@@ -19,8 +19,9 @@ FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，�
 | 6 | Celery 异步化：202 + 任务队列 + 两层超时 | 已完成 |
 | 7 | 历史对比：分数走势与建议差异 | 已完成 |
 | 8 | OpenAPI 文档：错误码、示例、401 文案统一 | 已完成 |
-| 9 | pytest 测试套件：101 个用例，SQLite + mock，3.8 秒跑完 | 已完成 |
+| 9 | pytest 测试套件：110 个用例，SQLite + mock，5 秒跑完 | 已完成 |
 | 10 | Alembic 数据库迁移：基线 + 版本链，已有数据的库用 stamp 接入 | 已完成 |
+| 11 | 僵尸任务清理：beat 每 5 分钟收敛卡在 pending / running 的记录 | 已完成 |
 
 后端到此为止。**前端还没做** —— 现在能看到的 `/docs` 是 FastAPI 自动生成的调试页，不是产品界面。
 
@@ -35,7 +36,7 @@ FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，�
 - 全部资源按用户隔离，越权访问统一返回 404 而不是 403，不泄露资源是否存在
 - 14 个接口的 OpenAPI 文档齐全：每个错误码都有说明和响应示例，`/docs` 可以直接当接口说明书用
 - `mypy` 全量通过（34 个文件，开了 `warn_unused_ignores`、`strict_equality` 等严格选项）
-- `pytest` 101 个用例全绿：认证、上传五道关、PDF/DOCX 解析、LLM 输出容错、分析状态机、差异计算
+- `pytest` 110 个用例全绿：认证、上传五道关、PDF/DOCX 解析、LLM 输出容错、分析状态机、差异计算、僵尸清理
 - 表结构变更走 Alembic 迁移，不再依赖 `create_all`
 
 ## 技术栈
@@ -174,13 +175,17 @@ python -m alembic current          # 确认版本号是 (head)
 # 终端 1：API
 uvicorn app.main:app --reload
 
-# 终端 2：worker
-celery -A app.workers.celery_app:celery_app worker -l info -P solo
+# 终端 2：worker + beat（开发期合在一起）
+celery -A app.workers.celery_app:celery_app worker -l info -P solo -B
 ```
 
 Windows 必须加 `-P solo`（或 `-P threads`），Celery 的 prefork 模型在 Windows 上不可用。
 
-**只起 API 不起 worker，分析记录会永远停在 `pending`** —— 这是异步系统的正常表现，不是 bug。
+`-B` 是内嵌 beat，负责定时投递清理任务（每 5 分钟扫一次僵尸记录）。它只适合单机 —— 多个 worker 各带一个 beat，同一个任务会被调度多次。生产环境要拆成三份：worker 一份、`celery ... beat` 单独一份。
+
+不想跑 beat 也可以，`-B` 去掉即可：代价是硬超时留下的 `running` 记录没人清理，前端会一直转圈。
+
+**只起 API 不起 worker，分析记录会停在 `pending`** —— 这是异步系统的正常表现，不是 bug。一小时后清理任务会把它标成 `failed` 并写明「worker 可能没有运行」，省得用户对着一个转圈的页面干等。
 
 ### 6. 试一试
 
@@ -217,7 +222,7 @@ curl http://127.0.0.1:8000/health
 | | `LLM_API_KEY` | 空 | `LLM_PROVIDER=openai` 时必填 |
 | | `LLM_BASE_URL` | `https://api.deepseek.com/v1` | 任何 OpenAI 兼容地址 |
 | | `LLM_MODEL` | `deepseek-chat` | |
-| | `LLM_TIMEOUT` | `90` | 单次请求超时（秒），直接决定 Celery 的软/硬超时 |
+| | `LLM_TIMEOUT` | `90` | 单次请求超时（秒）。连带决定 Celery 的软/硬超时和僵尸清理阈值，改完必须重启 worker |
 | | `LLM_MAX_RETRIES` | `2` | 内部重试次数，共尝试 3 次 |
 | | `LLM_TEMPERATURE` | `0.2` | 压低是为了打分可复现 |
 | | `LLM_MAX_TOKENS` | `2048` | |
@@ -315,10 +320,11 @@ app/
 │   ├── prompts.py        Prompt 与版本号
 │   ├── llm.py            调模型、解析与校验输出、重试
 │   ├── analysis.py       一次分析的完整编排，可同步调用
-│   └── comparison.py     两次分析的差异计算，纯函数
+│   ├── comparison.py     两次分析的差异计算，纯函数
+│   └── maintenance.py    僵尸记录清理，一条带条件的 UPDATE
 └── workers/
-    ├── celery_app.py     Celery 实例与配置
-    └── tasks.py          任务薄壳：Session 生命周期 + 超时信号
+    ├── celery_app.py     Celery 实例与配置、超时与清理阈值、beat 调度表
+    └── tasks.py          任务薄壳：Session 生命周期 + 超时信号 + 定时任务注册
 ```
 
 分层的意义：`services/` 里的东西既能被路由调用，也能被 worker 调用，还能被脚本和单元测试直接调用 —— 想批量重跑历史分析，`for` 循环调 `execute_analysis(db, id)` 就行，不用起 Redis。
@@ -383,6 +389,12 @@ python -m alembic check                      # 库结构与模型是否一致，
 
 **两层超时**：Celery 的 soft limit 300 秒先抛 `SoftTimeLimitExceeded`，任务捕获后把记录标成 `failed` 再退出；hard limit 330 秒由 worker 直接杀进程，兜住「异常处理里又卡住」的情况。这两个值必须大于 `LLM_TIMEOUT × (LLM_MAX_RETRIES + 1)`，否则会误杀还在正常重试的请求。
 
+**硬超时之后的僵尸记录**：hard limit 是直接杀进程，Python 来不及执行任何收尾代码，记录会留在 `running`；worker 被 OOM 或 `kill -9` 同理；broker 丢消息（Redis 没开持久化又重启过）则会让记录留在 `pending`。这三种情况 `execute_analysis` 都管不到，所以另有一个 beat 定时任务，每 5 分钟把「超过 450 秒还在 running」和「超过 1 小时还在 pending」的记录收敛成 `failed` 并写明原因。
+
+阈值的取法有讲究：running 的判定必须明显大于硬超时（`HARD_TIME_LIMIT + 120`），否则一个本就快跑完的任务会被误标 `failed`，随后又自己写成 `done` —— 用户看到状态在 `running / failed / done` 之间来回跳，比卡住更让人困惑。pending 给足一小时，因为「worker 暂时没起」和「消息丢了」从数据库里看不出区别，只能靠等。
+
+清理只做收敛、不做重试。后台偷偷重跑会烧 token，而且用户已经等了十几分钟，再让他等第二轮体验更差——要不要重来应该由用户自己决定。另外它天然幂等：`WHERE status == 'running'` 保证了第二轮 beat 扫到同一条记录时什么都没得改。
+
 **连接池**：`pool_pre_ping` + `pool_recycle=3600` 应付 MySQL 的 `wait_timeout`；prefork 模式下子进程会在 `worker_process_init` 里 `engine.dispose(close=False)`，否则多个进程共用同一个 TCP 连接，会出现只在高并发下才犯的「Packet sequence number wrong」。
 
 **上传六步**：扩展名 → 累加大小 → 魔数 → 落盘 → 解析 → 写库。后三步任一失败都要删掉已落盘的文件，否则磁盘会被垃圾文件慢慢堆满。
@@ -414,7 +426,7 @@ python -m alembic check                      # 库结构与模型是否一致，
 ```bash
 pip install -r requirements-dev.txt   # mypy + pytest + reportlab，不进生产依赖
 mypy                                  # 配置在 mypy.ini，默认检查 app/ 下的 34 个文件
-pytest                                # 配置在 pytest.ini，101 个用例约 4 秒
+pytest                                # 配置在 pytest.ini，110 个用例约 5 秒
 python -m alembic check               # 库结构与模型是否一致（可选，但要连真库）
 ```
 
@@ -455,7 +467,7 @@ pdfplumber 读的是 PDF 的文字层。拍照、复印后转出来的 PDF 只�
 - [ ] 前端界面（上传、轮询进度、分数走势图）—— 现在只有 `/docs` 调试页
 - [ ] 生产环境收紧 CORS（当前 `allow_origins=["*"]`，仅限开发期）
 - [ ] Celery 监控（Flower）与队列积压告警
-- [ ] 僵尸任务清理（`pending` / `running` 超时的记录，硬超时会留在 `running`）
+- [ ] CI：把 `mypy` / `pytest` / `alembic check` 串成一条流水线
 - [ ] `latency_ms` 只反映最后一次尝试，前面超时那几次的耗时丢了
 - [ ] `REQUIRED_SECTIONS` 和 `_SECTION_HINTS` 是两份手工维护的栏目列表，改一处忘另一处会出现「完整性说缺项目经历、打分却认为有」
 - [ ] CI：把 `mypy` / `pytest` / `alembic check` 串成一条流水线
