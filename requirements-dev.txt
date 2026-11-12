@@ -3,3 +3,6 @@
 -r requirements.txt
 
 mypy==2.4.1
+pytest==9.2.0
+# 测试里现场生成带文字层的 PDF，不往仓库塞二进制样本；生产环境用不到
+reportlab==5.1.0
