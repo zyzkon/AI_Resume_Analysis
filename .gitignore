@@ -27,3 +27,8 @@ uploads/
 .pytest_cache/
 .celerybeat-schedule
 *.log
+
+# 前端依赖与构建产物（node_modules 几万个文件，绝不提交）
+node_modules/
+web/dist/
+web/.env.local

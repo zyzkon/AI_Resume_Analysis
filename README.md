@@ -23,8 +23,9 @@ FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，�
 | 10 | Alembic 数据库迁移：基线 + 版本链，已有数据的库用 stamp 接入 | 已完成 |
 | 11 | 僵尸任务清理：beat 每 5 分钟收敛卡在 pending / running 的记录 | 已完成 |
 | 12 | CORS 收敛：来源走 `.env` 白名单，方法与请求头按下限放行 | 已完成 |
+| 13 | 前端界面：Vue 3 + Vite，上传、轮询进度、评分详情、走势与对比 | 已完成 |
 
-后端到此为止。**前端还没做** —— 现在能看到的 `/docs` 是 FastAPI 自动生成的调试页，不是产品界面。
+后端 14 个接口全部有界面覆盖，前端在 `web/`，独立构建、独立部署。开箱能看到的是登录页 —— 需要先起后端，再 `npm run dev`（见第 7 步）。
 
 ## 功能
 
@@ -40,12 +41,14 @@ FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，�
 - `pytest` 126 个用例全绿：认证、上传五道关、PDF/DOCX 解析、LLM 输出容错、分析状态机、差异计算、僵尸清理、CORS
 - 表结构变更走 Alembic 迁移，不再依赖 `create_all`
 - 跨域来源走白名单配置，默认只放行本机开发端口
+- **前端界面**（`web/`，Vue 3 + Vite）：登录注册、拖拽上传、提交分析后自动轮询进度、分数环、栏目完整性、逐条建议、分数走势折线、两次分析的差异对比
 
 ## 技术栈
 
 | 层 | 选型 |
 |---|---|
 | Web | FastAPI 0.162 · Uvicorn |
+| 前端 | Vue 3.5 · Vue Router · Vite 8（`web/`，独立构建，可单独部署） |
 | 数据 | SQLAlchemy 2.1 · MySQL 8（utf8mb4）· PyMySQL |
 | 队列 | Celery 5.6 · Redis 7+ |
 | 校验 | Pydantic 2 · pydantic-settings |
@@ -203,6 +206,22 @@ curl http://127.0.0.1:8000/health
 
 如果本机开了全局代理，curl 访问 127.0.0.1 可能被代理拦成 502，加 `--noproxy '*'`。
 
+### 7. 启动前端（可选）
+
+后端起来之后，另开一个终端：
+
+```bash
+cd web
+npm install     # 第一次，约 70 个包
+npm run dev     # http://127.0.0.1:5173
+```
+
+打开后先注册一个账号（邮箱 + 至少 8 位密码），然后上传简历 → 提交分析 → 等进度条跑完。
+
+前端只依赖 `vue` / `vue-router` / `vite`，没有 UI 库和图表库，构建产物 96 KB（gzip 37 KB）。为什么这么选、以及几个实现上的取舍，写在 [`web/README.md`](web/README.md)。
+
+**只起前端不起后端**：页面能打开，但登录会提示「连不上后端」。这是 CORS 预检失败或连接被拒，不是前端的问题。
+
 ## 配置项
 
 全部来自 `.env`，由 `app/core/config.py` 统一加载。必填项缺失时**导入即报错**，不会带着错误配置跑起来。
@@ -328,6 +347,20 @@ app/
 └── workers/
     ├── celery_app.py     Celery 实例与配置、超时与清理阈值、beat 调度表
     └── tasks.py          任务薄壳：Session 生命周期 + 超时信号 + 定时任务注册
+web/                        前端（Vue 3 + Vite），独立构建与部署
+├── index.html              唯一的 HTML，挂载点 + 内联 favicon
+├── vite.config.js          端口锁 5173、绑 IPv4
+├── package.json            依赖只有 vue / vue-router / vite / plugin-vue
+└── src/
+    ├── main.js             入口：先问一次 /auth/me，再挂载
+    ├── App.vue             顶栏 + 路由出口
+    ├── router.js           路由表与登录守卫
+    ├── api.js              fetch 封装：基地址、token、错误文案、401 登出
+    ├── auth.js             登录状态（reactive，没有用 Pinia）
+    ├── utils.js            日期 / 大小 / 耗时格式化
+    ├── styles.css          设计变量与公共类，没有 UI 库
+    ├── components/         ScoreRing（SVG 圆环）、StatusPill、TrendChart（SVG 折线）
+    └── views/              Login / ResumeList / ResumeDetail / Analysis / Compare
 ```
 
 分层的意义：`services/` 里的东西既能被路由调用，也能被 worker 调用，还能被脚本和单元测试直接调用 —— 想批量重跑历史分析，`for` 循环调 `execute_analysis(db, id)` 就行，不用起 Redis。
@@ -476,12 +509,12 @@ pdfplumber 读的是 PDF 的文字层。拍照、复印后转出来的 PDF 只�
 
 ## 待办
 
-- [ ] 前端界面（上传、轮询进度、分数走势图）—— 现在只有 `/docs` 调试页
 - [ ] Celery 监控（Flower）与队列积压告警
-- [ ] CI：把 `mypy` / `pytest` / `alembic check` 串成一条流水线
+- [ ] CI：把 `mypy` / `pytest` / `alembic check` / `npm run build` 串成一条流水线
+- [ ] 前端没有自动化测试（后端 126 个用例，前端 0 个；只有手写的接口封装，逻辑很薄，但路由守卫和轮询这两块值得补）
 - [ ] `latency_ms` 只反映最后一次尝试，前面超时那几次的耗时丢了
 - [ ] `REQUIRED_SECTIONS` 和 `_SECTION_HINTS` 是两份手工维护的栏目列表，改一处忘另一处会出现「完整性说缺项目经历、打分却认为有」
-- [ ] CI：把 `mypy` / `pytest` / `alembic check` 串成一条流水线
+- [ ] 生产部署：前端 `npm run build` 的产物要么由 nginx 托管并反代 `/api`，要么交给 FastAPI 的 `StaticFiles` 托管；后者能顺带把 CORS 完全去掉（同源）
 
 ## 说明
 
