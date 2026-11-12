@@ -2,7 +2,7 @@
 
 上传一份 PDF / DOCX 简历，调用大模型输出结构化评分：简历完整度、内容质量、岗位匹配度，以及按优先级排序的修改建议。
 
-FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，耗时几十秒的模型调用交给独立 worker 异步执行。
+FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，耗时几十秒的模型调用交给独立 worker 异步执行。界面用 Vue 3 + Vite，纯前端静态产物，和后端分开部署。
 
 > 个人学习项目，接口契约、Prompt 和表结构都还在迭代，不保证向后兼容。
 
@@ -113,6 +113,13 @@ GET /analyses/{id}
 
 ## 快速开始
 
+先把仓库拉下来，后面的命令默认都在根目录执行：
+
+```bash
+git clone https://github.com/zyzkon/AI_Resume_Analysis.git
+cd AI_Resume_Analysis
+```
+
 ### 1. 前置依赖
 
 - Python 3.12+
@@ -174,7 +181,7 @@ python -m alembic current          # 确认版本号是 (head)
 
 之后改表也走这套，别再回到 `create_all` —— 它只建不存在的表，模型加了字段它既不补列也不报错，应用直到查那一列才炸。详见 [数据库迁移](#数据库迁移)。
 
-### 5. 启动（两个终端）
+### 5. 启动后端（两个终端）
 
 ```bash
 # 终端 1：API
@@ -206,21 +213,31 @@ curl http://127.0.0.1:8000/health
 
 如果本机开了全局代理，curl 访问 127.0.0.1 可能被代理拦成 502，加 `--noproxy '*'`。
 
-### 7. 启动前端（可选）
+### 7. 启动前端
 
-后端起来之后，另开一个终端：
+后端起来之后，另开一个终端（第三个）：
 
 ```bash
 cd web
-npm install     # 第一次，约 70 个包
+npm install     # 第一次
 npm run dev     # http://127.0.0.1:5173
 ```
 
 打开后先注册一个账号（邮箱 + 至少 8 位密码），然后上传简历 → 提交分析 → 等进度条跑完。
 
+前端默认把请求发到 `http://127.0.0.1:8000`。后端换了地址或端口时，复制 `web/.env.example` 成 `web/.env` 改一行：
+
+```bash
+VITE_API_BASE_URL=http://127.0.0.1:8000
+```
+
+`VITE_` 前缀的变量由 Vite 在**构建时**注入，改完必须重启 `npm run dev`（热更新不会重新读 `.env`）；`npm run build` 的产物同理，换了后端地址要重新构建。
+
+要单独部署前端，`npm run build` 生成 `web/dist/`，交给 nginx 之类的静态服务器托管 —— 代价是后端 `CORS_ORIGINS` 必须把部署域名加进去。想彻底不碰跨域，可以让 FastAPI 用 `StaticFiles` 托管这个目录，前后端同源，CORS 中间件都可以摘掉。
+
 前端只依赖 `vue` / `vue-router` / `vite`，没有 UI 库和图表库，构建产物 96 KB（gzip 37 KB）。为什么这么选、以及几个实现上的取舍，写在 [`web/README.md`](web/README.md)。
 
-**只起前端不起后端**：页面能打开，但登录会提示「连不上后端」。这是 CORS 预检失败或连接被拒，不是前端的问题。
+**只起前端不起后端**：页面能打开，但登录会提示「连不上后端」。这是连接被拒或 CORS 预检失败，不是前端的问题。
 
 ## 配置项
 
@@ -349,8 +366,11 @@ app/
     └── tasks.py          任务薄壳：Session 生命周期 + 超时信号 + 定时任务注册
 web/                        前端（Vue 3 + Vite），独立构建与部署
 ├── index.html              唯一的 HTML，挂载点 + 内联 favicon
-├── vite.config.js          端口锁 5173、绑 IPv4
+├── vite.config.js          端口锁 5173、绑 IPv4，端口被占直接报错
 ├── package.json            依赖只有 vue / vue-router / vite / plugin-vue
+├── package-lock.json       锁版本，进仓库
+├── .env.example            VITE_API_BASE_URL，复制成 .env 才生效
+├── README.md               前端取舍记录：为什么不用 axios / Pinia / echarts
 └── src/
     ├── main.js             入口：先问一次 /auth/me，再挂载
     ├── App.vue             顶栏 + 路由出口
@@ -468,7 +488,11 @@ pip install -r requirements-dev.txt   # mypy + pytest + reportlab，不进生产
 mypy                                  # 配置在 mypy.ini，默认检查 app/ 下的 35 个文件
 pytest                                # 配置在 pytest.ini，126 个用例约 4 秒
 python -m alembic check               # 库结构与模型是否一致（可选，但要连真库）
+
+cd web && npm run build               # 前端构建，能抓语法与导入错误，产物在 dist/
 ```
+
+前端是纯 JS，没有 `vue-tsc`，所以 `npm run build` 只保证能编译，不做类型检查。
 
 `mypy.ini` 里开了 `warn_unused_ignores`、`warn_redundant_casts`、`warn_unreachable`、`no_implicit_optional`、`strict_equality` —— 这几项除了 `warn_unreachable` 之外几乎零误报，属于「开了不亏」。
 
@@ -506,6 +530,27 @@ pdfplumber 读的是 PDF 的文字层。拍照、复印后转出来的 PDF 只�
 先看控制台里那条预检（`OPTIONS`）请求的实际响应。按出现频率排：origin 少了协议头、带了结尾斜杠（`http://a.com/` 与 `http://a.com` 是两个不同字符串）、写的是 `localhost` 而浏览器访问的是 `127.0.0.1`（两者是不同 origin）、端口不对、改完 `CORS_ORIGINS` 没重启 API。
 
 注意这类失败在服务端**不会留下任何错误**：不在名单里的来源，接口照常执行、照常返回 200，只是少一个 `Access-Control-Allow-Origin` 头，浏览器于是拒绝把响应交给页面 JS。「接口调通了但页面读不到数据」就是没匹配上。所以 CORS 不是鉴权 —— `tests/test_cors.py` 里 `test_blocked_origin_still_gets_response` 专门钉死了这一点。
+
+**`npm run dev` 报 `Port 5173 is already in use`**
+上一次的进程没退干净。Windows 上直接关掉终端窗口不会回收子进程，`vite.js` 会继续占着端口。按端口找到 PID 再连同子树一起杀：
+
+```powershell
+Get-NetTCPConnection -LocalPort 5173 -State Listen | Select-Object OwningProcess
+taskkill /PID <上一步的 PID> /T /F
+```
+
+`/T` 是关键 —— 只杀最外层的 npm，底下那个 `vite.js` 会变成孤儿继续监听。也别图省事让它换到 5174：后端 `CORS_ORIGINS` 只放行 5173，换端口的表现是「页面能打开、所有请求被拦」，比直接起不来更难查。
+
+**前端构建后部署到 nginx，刷新页面 404**
+路由用的是 history 模式（地址栏没有 `#`），`/resumes/3` 这类路径在服务器上并不存在真实文件。需要让 nginx 把找不到的路径回退到 `index.html`：
+
+```nginx
+location / {
+    try_files $uri $uri/ /index.html;
+}
+```
+
+Vite 的开发服务器自带这个回退，所以只有部署后才暴露。
 
 ## 待办
 
