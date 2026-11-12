@@ -19,6 +19,8 @@ FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，�
 | 6 | Celery 异步化：202 + 任务队列 + 两层超时 | 已完成 |
 | 7 | 历史对比：分数走势与建议差异 | 已完成 |
 | 8 | OpenAPI 文档：错误码、示例、401 文案统一 | 已完成 |
+| 9 | pytest 测试套件：101 个用例，SQLite + mock，3.8 秒跑完 | 已完成 |
+| 10 | Alembic 数据库迁移：基线 + 版本链，已有数据的库用 stamp 接入 | 已完成 |
 
 后端到此为止。**前端还没做** —— 现在能看到的 `/docs` 是 FastAPI 自动生成的调试页，不是产品界面。
 
@@ -33,6 +35,8 @@ FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，�
 - 全部资源按用户隔离，越权访问统一返回 404 而不是 403，不泄露资源是否存在
 - 14 个接口的 OpenAPI 文档齐全：每个错误码都有说明和响应示例，`/docs` 可以直接当接口说明书用
 - `mypy` 全量通过（34 个文件，开了 `warn_unused_ignores`、`strict_equality` 等严格选项）
+- `pytest` 101 个用例全绿：认证、上传五道关、PDF/DOCX 解析、LLM 输出容错、分析状态机、差异计算
+- 表结构变更走 Alembic 迁移，不再依赖 `create_all`
 
 ## 技术栈
 
@@ -44,7 +48,8 @@ FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，�
 | 校验 | Pydantic 2 · pydantic-settings |
 | 模型 | OpenAI 兼容接口（默认 DeepSeek），内置 `mock` 模式可离线跑通全流程 |
 | 解析 | pdfplumber · python-docx |
-| 检查 | mypy（`requirements-dev.txt`，不进生产依赖） |
+| 迁移 | Alembic（`requirements.txt`，部署时要在应用之外单独跑） |
+| 检查 | mypy · pytest（`requirements-dev.txt`，不进生产依赖） |
 
 ## 架构
 
@@ -148,7 +153,7 @@ cp .env.example .env
 
 ### 4. 建库建表
 
-库要先建好，表由脚本创建。登录 MySQL（`mysql -uroot -p`）后执行：
+库要先建好（表由迁移脚本创建）。登录 MySQL（`mysql -uroot -p`）后执行：
 
 ```sql
 CREATE DATABASE resume_db DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
@@ -157,10 +162,11 @@ GRANT ALL PRIVILEGES ON resume_db.* TO 'resume'@'%';
 ```
 
 ```bash
-python -m app.db.init_db
+python -m alembic upgrade head     # 顺着迁移链建出三张表
+python -m alembic current          # 确认版本号是 (head)
 ```
 
-`create_all` 只建不存在的表，**不会改已有表结构**。改字段要手动 ALTER 或上 Alembic。
+之后改表也走这套，别再回到 `create_all` —— 它只建不存在的表，模型加了字段它既不补列也不报错，应用直到查那一列才炸。详见 [数据库迁移](#数据库迁移)。
 
 ### 5. 启动（两个终端）
 
@@ -275,6 +281,13 @@ LLM_MODEL=deepseek-chat
 ## 目录结构
 
 ```
+alembic.ini                 迁移配置（不含数据库地址，故意留空）
+alembic/
+├── env.py                  迁移环境：连接串取自 settings，target_metadata 挂 Base
+├── script.py.mako          新迁移文件的模板
+├── README                  常用命令与两个坑，改表前先看一眼
+└── versions/
+    └── 20261112_d2bcc03fb86a_baseline.py   基线：create_all 时代的三张表
 app/
 ├── main.py               FastAPI 实例、中间件、路由注册
 ├── api/
@@ -286,7 +299,7 @@ app/
 │   └── security.py       密码哈希、JWT 签发与校验
 ├── db/
 │   ├── session.py        engine、连接池、SessionLocal
-│   └── init_db.py        建表脚本
+│   └── init_db.py        开发兜底建表，正式建表走 Alembic
 ├── models/               SQLAlchemy 表定义
 │   ├── user.py           users：邮箱唯一，密码只存 bcrypt 哈希
 │   ├── resume.py         resumes：原文件名 + UUID 落盘名 + 解析后的正文
@@ -337,6 +350,33 @@ erDiagram
 
 时间字段全存 UTC。混用本地时会算出负的排队时间。
 
+## 数据库迁移
+
+`create_all` 只能建「不存在」的表。表一旦存在，它就整张跳过 —— 不检查、不提醒、不报错。所以在模型里加一列再跑一次，输出照样是「建表完成」，应用也能启动，直到第一个请求查到那一列才报 `Unknown column`。
+
+Alembic 把每次结构改动写成一个文件，文件之间用 `down_revision` 串成版本链，库里一张 `alembic_version` 单行表记着「执行到哪一版」。`upgrade head` 读这个指针，把后面没跑过的脚本依次执行完。
+
+```bash
+python -m alembic current                    # 当前版本
+python -m alembic history                    # 版本链
+python -m alembic revision --autogenerate -m "加 xxx 字段"
+python -m alembic upgrade head
+python -m alembic downgrade -1               # 回退一格
+python -m alembic check                      # 库结构与模型是否一致，适合放 CI
+```
+
+改表的固定流程：**改模型 → `revision --autogenerate` → 逐行审脚本 → `upgrade head` → 跑 pytest**。第二步的产出永远是草稿：改列名会被渲染成 `drop_column` + `add_column`，脚本执行成功、版本号也进了，只是那一列的数据没了。要手工改成 `op.alter_column('表', '旧名', new_column_name='新名')`。
+
+三个约定：
+
+- **连接串不写进 `alembic.ini`**。`env.py` 从 `settings.DATABASE_URL` 取，保证迁移和应用指向同一个库；临时换库用环境变量 `ALEMBIC_DATABASE_URL` 覆盖
+- **一个迁移只做一件事**。MySQL 的 DDL 不能回滚，一个脚本里改三张表、第二条失败时，第一条已经生效但版本号没更新，重跑直接报「列已存在」
+- **不在应用启动时 upgrade**。多 worker / 多实例同时起会并发执行同一批 DDL。迁移是部署流程里独立的一步
+
+**已有数据的库怎么接入**：本项目这三张表是 `create_all` 建的，直接跑 baseline 会因「表已存在」失败。做法是先对着空库 `--autogenerate` 生成 baseline（描述现状），再对真实库执行 `python -m alembic stamp head` —— 它只把版本号写进 `alembic_version`，不执行任何 DDL。这一步做完，库和迁移链才算对上账，之后的版本才是真正的 `upgrade`。
+
+**测试不用迁移**。`tests/conftest.py` 仍然是每用例 `create_all` / `drop_all`：内存 SQLite 上建三张表只要几毫秒，跑一串迁移纯属加负担，而且脚本里的 MySQL 语法在 SQLite 上本来就跑不通。代价是「模型改了、迁移忘了写」时测试照样全绿，这个洞用 `alembic check` 堵。
+
 ## 关键设计
 
 **异步而不丢任务**：提交时先落一条 `pending` 记录再 `.delay()`。顺序反过来的话，worker 可能在记录还不存在时就开始跑。任务开了 `acks_late`，worker 中途被杀消息会重新投递，所以 `execute_analysis` 里做了幂等判断（已是 `done` 就跳过）。
@@ -372,8 +412,10 @@ erDiagram
 ## 代码检查
 
 ```bash
-pip install -r requirements-dev.txt   # 只有 mypy，不污染生产依赖
+pip install -r requirements-dev.txt   # mypy + pytest + reportlab，不进生产依赖
 mypy                                  # 配置在 mypy.ini，默认检查 app/ 下的 34 个文件
+pytest                                # 配置在 pytest.ini，101 个用例约 4 秒
+python -m alembic check               # 库结构与模型是否一致（可选，但要连真库）
 ```
 
 `mypy.ini` 里开了 `warn_unused_ignores`、`warn_redundant_casts`、`warn_unreachable`、`no_implicit_optional`、`strict_equality` —— 这几项除了 `warn_unreachable` 之外几乎零误报，属于「开了不亏」。
@@ -397,21 +439,26 @@ worker 没启动。`pending` 只表示记录已入库、消息已投递，没有
 pdfplumber 读的是 PDF 的文字层。拍照、复印后转出来的 PDF 只有图像、没有文字层，抽出来是空字符串。这种情况需要在客户端先做 OCR，本项目不做。
 
 **`create_all` 之后改字段没生效**
-它只建不存在的表，**不改已有表结构**。改字段要么手工 `ALTER TABLE`，要么等 Alembic 接上。
+它只建不存在的表，**不改已有表结构**。改字段走 Alembic：`revision --autogenerate` → 审脚本 → `upgrade head`。
+
+**`alembic` 一启动就报 UnicodeDecodeError**
+`alembic.ini` 是按系统本地编码（中文 Windows 上是 GBK）读的，文件里不能写中文注释，否则 `'gbk' codec can't decode`。注释用英文，说明性内容放 `alembic/README`。
+
+**改了模型，`alembic check` 说没差异 / 或者报一堆无关差异**
+前者说明模型没被 import 进 `Base.metadata` —— `alembic/env.py` 里那行 `import app.models` 不能删。后者通常是 `server_default` 在作怪，本项目已把 `compare_server_default` 关掉：MySQL 会把 `CURRENT_TIMESTAMP` 回读成 `now()`，一比就永远不相等。
 
 **连不上 MySQL / 端口对不上**
 仓库里的 `docker-compose.yml` 把 MySQL 映射到 **3307**（避免和本机已装的 MySQL 抢 3306），而快速开始里那条 `docker run` 用的是 3306。`DATABASE_URL` 里的端口必须和实际映射一致。密码里含 `@` `:` `/` 时要做 URL 编码，否则会被当成连接串的分隔符。
 
 ## 待办
 
-- [ ] **pytest 测试套件**（目前只有 `test_main.http` 手工验证，每加一个功能都是临时脚本跑一遍、跑完就扔）
-- [ ] Alembic 迁移（现在改字段只能手工 `ALTER`）
-- [ ] 前端界面（上传、轮询进度、分数走势图）
+- [ ] 前端界面（上传、轮询进度、分数走势图）—— 现在只有 `/docs` 调试页
 - [ ] 生产环境收紧 CORS（当前 `allow_origins=["*"]`，仅限开发期）
 - [ ] Celery 监控（Flower）与队列积压告警
 - [ ] 僵尸任务清理（`pending` / `running` 超时的记录，硬超时会留在 `running`）
 - [ ] `latency_ms` 只反映最后一次尝试，前面超时那几次的耗时丢了
 - [ ] `REQUIRED_SECTIONS` 和 `_SECTION_HINTS` 是两份手工维护的栏目列表，改一处忘另一处会出现「完整性说缺项目经历、打分却认为有」
+- [ ] CI：把 `mypy` / `pytest` / `alembic check` 串成一条流水线
 
 ## 说明
 

@@ -1,0 +1,38 @@
+数据库迁移（Alembic）
+=====================
+
+连接串不在这里配置。alembic/env.py 从 app.core.config.settings 读 DATABASE_URL，
+保证迁移和应用永远指向同一个库。需要临时指向别的库（例如对空库生成基线）时，
+用环境变量覆盖，不要改 alembic.ini：
+
+    ALEMBIC_DATABASE_URL="sqlite:///tmp.db" python -m alembic upgrade head
+
+日常命令
+--------
+    python -m alembic current                   # 当前库里执行到哪一版
+    python -m alembic history --verbose         # 完整版本链
+    python -m alembic revision --autogenerate -m "加 xxx 字段"
+    python -m alembic upgrade head              # 往前推到最新
+    python -m alembic downgrade -1              # 回退一格
+    python -m alembic check                     # 库结构与模型是否一致（CI 里跑）
+
+改表的标准流程
+--------------
+1. 改 app/models/ 下的模型
+2. python -m alembic revision --autogenerate -m "说明"
+3. **逐行审 versions/ 下新生成的脚本**（改列名会被写成删列+加列，数据丢失）
+4. python -m alembic upgrade head
+5. 跑一遍 pytest
+
+两个坑
+------
+- MySQL 的 DDL 不能回滚：一个迁移里改三张表，第二条失败时第一条已经生效，
+  版本号却没更新，重跑直接报"列已存在"。所以一个迁移只做一件事。
+- 别在应用启动时自动 upgrade：多 worker / 多实例同时起会并发执行同一批 DDL。
+  迁移是部署流程里独立的一步。
+
+本项目的基线
+------------
+20261112_d2bcc03fb86a_baseline.py 描述的是"create_all 时代"就存在的三张表。
+新库直接 upgrade head 即可；已有数据的库当初是用 alembic stamp head 接入的，
+只写了版本号，没有重跑 DDL。
