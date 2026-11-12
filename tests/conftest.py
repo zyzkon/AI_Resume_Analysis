@@ -25,6 +25,12 @@ os.environ["UPLOAD_DIR"] = str(Path(tempfile.gettempdir()) / "resume-analyzer-te
 # .env 里通常有 SECRET_KEY，但 CI 环境没有；setdefault 不会覆盖已有的值
 os.environ.setdefault("SECRET_KEY", "test-only-secret-key-0123456789abcdef")
 
+# 前端来源写死，别让用例受本机 .env 影响 —— 否则「这台机器全绿、换台机器全红」
+CORS_ALLOWED = "http://localhost:5173"
+CORS_ALLOWED_ALT = "http://127.0.0.1:5173"
+CORS_BLOCKED = "https://evil.example"
+os.environ["CORS_ORIGINS"] = f"{CORS_ALLOWED},{CORS_ALLOWED_ALT}"
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
@@ -134,6 +140,20 @@ def user(db: Session) -> User:
 def auth_headers(user: User) -> dict[str, str]:
     """现成的认证头，省掉「注册 + 登录」两步 HTTP 往返。"""
     return {"Authorization": f"Bearer {create_access_token(user.id)}"}
+
+
+@pytest.fixture
+def cors_origins() -> dict[str, str]:
+    """三个固定来源：白名单里的两个（证明逗号真被拆开）、以及一个不在名单上的。
+
+    来源值必须和上面写进环境变量的一致；单独开 fixture 是为了让用例读起来
+    是 `cors_origins["blocked"]`，而不是一堆硬编码的 URL。
+    """
+    return {
+        "allowed": CORS_ALLOWED,
+        "allowed_alt": CORS_ALLOWED_ALT,
+        "blocked": CORS_BLOCKED,
+    }
 
 
 @pytest.fixture

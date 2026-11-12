@@ -19,9 +19,10 @@ FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，�
 | 6 | Celery 异步化：202 + 任务队列 + 两层超时 | 已完成 |
 | 7 | 历史对比：分数走势与建议差异 | 已完成 |
 | 8 | OpenAPI 文档：错误码、示例、401 文案统一 | 已完成 |
-| 9 | pytest 测试套件：110 个用例，SQLite + mock，5 秒跑完 | 已完成 |
+| 9 | pytest 测试套件：126 个用例，SQLite + mock，4 秒跑完 | 已完成 |
 | 10 | Alembic 数据库迁移：基线 + 版本链，已有数据的库用 stamp 接入 | 已完成 |
 | 11 | 僵尸任务清理：beat 每 5 分钟收敛卡在 pending / running 的记录 | 已完成 |
+| 12 | CORS 收敛：来源走 `.env` 白名单，方法与请求头按下限放行 | 已完成 |
 
 后端到此为止。**前端还没做** —— 现在能看到的 `/docs` 是 FastAPI 自动生成的调试页，不是产品界面。
 
@@ -35,9 +36,10 @@ FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，�
 - **历史对比**：同一份简历多次分析的分数走势，以及两次分析之间的建议变化（新增 / 已解决 / 仍存在）
 - 全部资源按用户隔离，越权访问统一返回 404 而不是 403，不泄露资源是否存在
 - 14 个接口的 OpenAPI 文档齐全：每个错误码都有说明和响应示例，`/docs` 可以直接当接口说明书用
-- `mypy` 全量通过（34 个文件，开了 `warn_unused_ignores`、`strict_equality` 等严格选项）
-- `pytest` 110 个用例全绿：认证、上传五道关、PDF/DOCX 解析、LLM 输出容错、分析状态机、差异计算、僵尸清理
+- `mypy` 全量通过（35 个文件，开了 `warn_unused_ignores`、`strict_equality` 等严格选项）
+- `pytest` 126 个用例全绿：认证、上传五道关、PDF/DOCX 解析、LLM 输出容错、分析状态机、差异计算、僵尸清理、CORS
 - 表结构变更走 Alembic 迁移，不再依赖 `create_all`
+- 跨域来源走白名单配置，默认只放行本机开发端口
 
 ## 技术栈
 
@@ -215,6 +217,7 @@ curl http://127.0.0.1:8000/health
 | | `ACCESS_TOKEN_EXPIRE_MINUTES` | `1440` | 24 小时 |
 | 数据库 | `DATABASE_URL` | 见 `.env.example` | 必须以 `mysql+pymysql://` 开头，有校验器拦 |
 | | `DB_ECHO` | `false` | 打开后每条 SQL 打印到控制台 |
+| 跨域 | `CORS_ORIGINS` | 本机 `:5173` | 逗号分隔、必须带协议头、不能带路径。留空 = 不允许跨域 |
 | 上传 | `UPLOAD_DIR` | `uploads` | 相对路径按项目根目录解析 |
 | | `MAX_UPLOAD_MB` | `5` | 边读边累加，超限立刻中断 |
 | 队列 | `REDIS_URL` | `redis://localhost:6379/0` | broker 和 backend 共用同一个库 |
@@ -421,12 +424,16 @@ python -m alembic check                      # 库结构与模型是否一致，
 
 **每个请求都查一次库**：JWT 是无状态的，签发之后无法撤销 —— 用户被禁用、账号被删，只要旧 token 没过期就还能用。`get_current_user` 每次走主键索引查一次（成本极低），换来禁用立即生效。
 
+**CORS 收紧到白名单**：`allow_origins` 从 `["*"]` 换成 `.env` 里的 `CORS_ORIGINS`。`*` 的问题不是「谁都能调接口」—— CORS 只是浏览器策略，`curl` 和 Postman 根本不看它 —— 而是它让配置错误无处暴露：等你上线换成具体域名的那天，才会发现前端用的 origin 拼错、或者漏了 `www.`。同理 `allow_methods` 只列了实际用到的 `GET / POST / DELETE`：写 `*` 会被 Starlette 展开成 `ALL_METHODS`，等于对外声明「支持 PUT 和 PATCH」，而这两个方法一个都没实现。
+
+`allow_credentials=False` 与「用 Bearer token」并不矛盾，这是最容易搞混的一处：CORS 里的 credentials 只涵盖 **cookie、浏览器自带的 Basic 认证、TLS 客户端证书**；代码里手动塞进 `Authorization` 头的 token 属于普通请求头，归 `allow_headers` 管。哪天改成用 cookie 存 token 才需要打开它，同时 `allow_origins` 必须全是具体域名（规范里 `*` 与 credentials 互斥）。
+
 ## 代码检查
 
 ```bash
 pip install -r requirements-dev.txt   # mypy + pytest + reportlab，不进生产依赖
-mypy                                  # 配置在 mypy.ini，默认检查 app/ 下的 34 个文件
-pytest                                # 配置在 pytest.ini，110 个用例约 5 秒
+mypy                                  # 配置在 mypy.ini，默认检查 app/ 下的 35 个文件
+pytest                                # 配置在 pytest.ini，126 个用例约 4 秒
 python -m alembic check               # 库结构与模型是否一致（可选，但要连真库）
 ```
 
@@ -462,10 +469,14 @@ pdfplumber 读的是 PDF 的文字层。拍照、复印后转出来的 PDF 只�
 **连不上 MySQL / 端口对不上**
 仓库里的 `docker-compose.yml` 把 MySQL 映射到 **3307**（避免和本机已装的 MySQL 抢 3306），而快速开始里那条 `docker run` 用的是 3306。`DATABASE_URL` 里的端口必须和实际映射一致。密码里含 `@` `:` `/` 时要做 URL 编码，否则会被当成连接串的分隔符。
 
+**浏览器报 `blocked by CORS policy`**
+先看控制台里那条预检（`OPTIONS`）请求的实际响应。按出现频率排：origin 少了协议头、带了结尾斜杠（`http://a.com/` 与 `http://a.com` 是两个不同字符串）、写的是 `localhost` 而浏览器访问的是 `127.0.0.1`（两者是不同 origin）、端口不对、改完 `CORS_ORIGINS` 没重启 API。
+
+注意这类失败在服务端**不会留下任何错误**：不在名单里的来源，接口照常执行、照常返回 200，只是少一个 `Access-Control-Allow-Origin` 头，浏览器于是拒绝把响应交给页面 JS。「接口调通了但页面读不到数据」就是没匹配上。所以 CORS 不是鉴权 —— `tests/test_cors.py` 里 `test_blocked_origin_still_gets_response` 专门钉死了这一点。
+
 ## 待办
 
 - [ ] 前端界面（上传、轮询进度、分数走势图）—— 现在只有 `/docs` 调试页
-- [ ] 生产环境收紧 CORS（当前 `allow_origins=["*"]`，仅限开发期）
 - [ ] Celery 监控（Flower）与队列积压告警
 - [ ] CI：把 `mypy` / `pytest` / `alembic check` 串成一条流水线
 - [ ] `latency_ms` 只反映最后一次尝试，前面超时那几次的耗时丢了

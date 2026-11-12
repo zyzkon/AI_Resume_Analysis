@@ -74,12 +74,26 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    # 仅限开发环境。上线前必须换成具体的前端域名：
-    # "*" 配合 allow_credentials=True 会被浏览器直接拒绝，而且等于允许任意站点调用接口
-    allow_origins=["*"],
+    # 来源列在 .env 的 CORS_ORIGINS 里，逗号分隔；默认只有本机的开发端口。
+    # 绝不写 "*"：那等于允许任何站点的 JS 读这个接口的响应，
+    # 而且会掩盖配置错误 —— 上线换成具体域名的那天，
+    # 才发现前端用的 origin 拼错、或者带了 www.
+    allow_origins=settings.cors_origins,
+    # 这里保持 False 是对的，而且和「用 Bearer token」并不矛盾。
+    # CORS 里的 "credentials" 只涵盖 cookie、浏览器自带的 Basic 认证、TLS 客户端证书；
+    # 代码里手动塞进 Authorization 头的 token 属于「普通请求头」，
+    # 由 allow_headers 管辖，跟这个开关无关。
+    # 哪天改成用 cookie 存 token，才需要把它翻成 True —— 同时 allow_origins 必须
+    # 全是具体域名（"*" 与 True 在浏览器规范里互斥）
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # 只列接口真正用到的方法。写 "*" 会被 Starlette 展开成 ALL_METHODS，
+    # 等于对外声明「支持 PUT / PATCH」，而这两个方法一个都没有实现
+    allow_methods=["GET", "POST", "DELETE"],
+    # 同理，只放行自己会用到的头。注意 Content-Type: multipart/form-data 属于
+    # CORS 安全头，本来就不触发预检；列进来是为了 application/json 的那些请求
+    allow_headers=["Authorization", "Content-Type"],
+    # 预检结果在浏览器里缓存 10 分钟，省掉每个非简单请求前的一趟 OPTIONS 往返
+    max_age=600,
 )
 
 # 路由必须在这里注册，app 对象才算"认识"这些路径。

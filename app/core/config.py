@@ -39,6 +39,14 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "mysql+pymysql://resume:resume_pass_2026@127.0.0.1:3306/resume_db?charset=utf8mb4"
     DB_ECHO: bool = False
 
+    # ---- 跨域 ----
+    # 逗号分隔的完整 origin 列表。默认只放行本机 5173 端口（Vite / Vue / React 的默认端口）。
+    # 为什么 localhost 和 127.0.0.1 都写上：它们是**两个不同的 origin**，
+    # 浏览器按字符串精确比对，少一个就会出现「同事那边能跑、我这边被拦」。
+    # 换成别的端口，或者上线换域名，改这一行即可；留空表示不允许任何跨域
+    # （前端与接口同域部署时用空值）
+    CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
+
     UPLOAD_DIR: Path = Path("uploads")
     MAX_UPLOAD_MB: int = 5
 
@@ -94,6 +102,54 @@ class Settings(BaseSettings):
         if provider != "mock" and not value.strip():
             raise ValueError(f"LLM_PROVIDER={provider} 时必须配置 LLM_API_KEY")
         return value.strip()
+
+    @field_validator("CORS_ORIGINS", mode="after")
+    @classmethod
+    def _normalize_cors_origins(cls, value: str, info: ValidationInfo) -> str:
+        """把 `a, b/, c` 归一成 `a,b,c`，顺手挡掉三种最常见的写错。
+
+        为什么不直接用 `list[str]`：pydantic-settings 读 list 时按 JSON 解析，
+        `.env` 里得写成 `CORS_ORIGINS=["http://a","http://b"]`，引号和括号都要，
+        手写容易漏。逗号分隔的字符串更好写，在这里转成列表。
+
+        三种写错都必须当场拦下，因为它们的表现都是「配置看着没问题，
+        浏览器就是不让你请求」，排查时最容易被怀疑到别的方向去：
+
+        1. 缺协议头 —— `localhost:5173` 永远不会等于浏览器发来的 `http://localhost:5173`
+        2. 带路径 —— 浏览器发来的 Origin 只有 `协议://域名[:端口]`，写 `http://a.com/api` 匹配不到
+        3. 结尾斜杠 —— `http://a.com/` 与 `http://a.com` 是**两个不同字符串**
+        """
+        items: list[str] = []
+        for raw in value.split(","):
+            # 结尾斜杠直接削掉，而不是报错：这是无害的笔误，帮用户修好就行
+            item = raw.strip().rstrip("/")
+            if not item:
+                continue
+            if item != "*":
+                if "://" not in item:
+                    raise ValueError(
+                        f"CORS_ORIGINS 里的每一项都要带协议头（http:// 或 https://），当前为: {item}"
+                    )
+                if "/" in item.split("://", 1)[1]:
+                    raise ValueError(
+                        f"CORS_ORIGINS 不能带路径，浏览器发来的 Origin 只有 协议://域名[:端口]，当前为: {item}"
+                    )
+            items.append(item)
+
+        # "*" 在生产环境等于「任何站点都能读这个接口的响应」，只允许开发期图省事
+        if "*" in items and not info.data.get("DEBUG", True):
+            raise ValueError(
+                "DEBUG=false 时 CORS_ORIGINS 不能含 *，请列出具体的前端域名（例如 https://resume.example.com）"
+            )
+        return ",".join(items)
+
+    @property
+    def cors_origins(self) -> list[str]:
+        """给 `CORSMiddleware(allow_origins=...)` 用的列表形式。
+
+        空字符串 -> 空列表 -> 中间件不放行任何跨域来源（同源部署的正确形态）。
+        """
+        return [item for item in self.CORS_ORIGINS.split(",") if item]
 
     @property
     def llm_is_mock(self) -> bool:
