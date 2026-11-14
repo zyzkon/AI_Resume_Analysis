@@ -1,33 +1,149 @@
-# 当前环境并不使用这个文件 —— 项目连的是本机已有的 mysql:8.0 容器（3306），
-# 库名 resume_db，用户 resume / resume_pass_2026。
+# 一套 compose 起完整环境：MySQL + Redis + 迁移 + API + worker + beat + 静态站点。
 #
-# 这个文件是"那台 MySQL 万一被删了，怎么从零重建"的备份方案。
-# 端口用 3307 是为了不和现有实例抢 3306；真要切过来，
-# 把 .env 里的 DATABASE_URL 端口改成 3307 即可。
+#   cp .env.docker.example .env.docker   # 先改里面的密码和 SECRET_KEY
+#   docker compose up -d --build
+#   浏览器打开 http://127.0.0.1:8080
 #
-# 用法：docker compose up -d
+# 这是"部署形态"，和本地裸跑（uvicorn + npm run dev）是两条并行路径：
+# 本地那套连宿主机的 MySQL(3306)，这里连容器里的 mysql 服务，两边数据互不影响。
+
+name: resume-analyzer
+
+# api / worker / beat 只差一个启动命令，共用一个镜像。
+# 用锚点而不是写四遍 build：同一个 image tag，compose 只会真正构建一次
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  image: resume-analyzer-api:local
+  # 一份文件同时喂给应用和 MySQL 镜像：前者读 DATABASE_URL / SECRET_KEY，
+  # 后者读 MYSQL_ROOT_PASSWORD / MYSQL_DATABASE 这类官方约定的变量。
+  # 所以不需要在 compose 里写 ${} 插值，也就不需要 --env-file 参数
+  env_file: .env.docker
+  restart: unless-stopped
 
 services:
   mysql:
     image: mysql:8.0
-    container_name: resume-mysql-standby
+    container_name: resume-mysql
     restart: unless-stopped
-    ports:
-      - "3307:3306"
-    environment:
-      MYSQL_ROOT_PASSWORD: root_pass_2026
-      MYSQL_DATABASE: resume_db
-      MYSQL_USER: resume
-      MYSQL_PASSWORD: resume_pass_2026
-      TZ: UTC
+    env_file: .env.docker
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_0900_ai_ci
+      # 存 UTC：应用层算「排队耗时 / 执行耗时」靠时间戳相减，
+      # 服务器时区和应用时区不一致会算出负数
       - --default-time-zone=+00:00
     volumes:
-      - ./docker/mysql-data:/var/lib/mysql
+      - mysql-data:/var/lib/mysql
+    # 映射到 3307 只是为了方便用 DataGrip 连进去看数据，生产可以整段删掉。
+    # 容器之间走 compose 内部网络，永远是 3306，跟这个映射无关
+    ports:
+      - "3307:3306"
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uresume", "-presume_pass_2026"]
+      # $$ 是 compose 的转义，落到容器里变成 $MYSQL_ROOT_PASSWORD 由 sh 展开。
+      # 直接写 -p 明文的话，密码会出现在 docker inspect 里
+      test: ["CMD-SHELL", 'mysqladmin ping -h 127.0.0.1 -uroot -p"$$MYSQL_ROOT_PASSWORD" --silent']
       interval: 5s
       timeout: 3s
-      retries: 20
+      retries: 30
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    container_name: resume-redis
+    restart: unless-stopped
+    # appendonly：不开的话 Redis 重启会丢队列里的消息，
+    # 表现是数据库里一堆 pending 记录、没有任何 worker 认领过它们。
+    # 一小时后 beat 的清理任务才会把它们标成 failed，用户白等
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # 建表/改表单独跑一步，不塞进应用的启动流程。
+  # 多实例同时启动时各自跑一遍 upgrade 会并发执行同一批 DDL，
+  # 而 MySQL 的 DDL 不能回滚，第二条必然报「列已存在」
+  migrate:
+    <<: *app
+    container_name: resume-migrate
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    container_name: resume-api
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    volumes:
+      # 命名卷而不是 bind mount：简历文件必须比容器活得久。
+      # 不挂的话每次 --build 重建容器，数据库里的记录还在、文件没了，点详情直接 500
+      - uploads:/app/uploads
+    ports:
+      - "8000:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # slim 镜像里没有 curl，用 python 自带的 urllib 探活
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  worker:
+    <<: *app
+    container_name: resume-worker
+    # 这里的 concurrency 是 prefork 的进程数。分析任务是 IO 密集（等模型返回），
+    # 4 个进程足够压满；调大要先算连接池：每个进程一个 engine，池上限要乘回来
+    command: ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "-l", "info", "--concurrency", "4"]
+    volumes:
+      - uploads:/app/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # beat 单独一个进程。多个 worker 各带一个 -B 时，同一个定时任务会被投递多次，
+  # 清理任务本身幂等所以不会出事，但这是运气不是设计
+  beat:
+    <<: *app
+    container_name: resume-beat
+    command: ["celery", "-A", "app.workers.celery_app:celery_app", "beat", "-l", "info", "-s", "/tmp/celerybeat-schedule"]
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # 前端构建产物 + 反向代理，是唯一对外的入口
+  web:
+    build:
+      context: .
+      target: web-server
+    image: resume-analyzer-web:local
+    container_name: resume-web
+    restart: unless-stopped
+    # 本地用 8080，避免和宿主机的 80 端口冲突；上线改成 "80:80" / "443:443"
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  mysql-data:
+  redis-data:
+  uploads:

@@ -1,0 +1,33 @@
+# Caddy 同时干两件事：托管前端静态文件、把 /api 转发给后端。
+# 两者在同一个 origin 下，所以生产环境根本不存在跨域 —— 后端的 CORS 白名单
+# 只在本地开发（5173 -> 8000）时才需要。
+#
+# 上线换域名时，把 ":80" 改成 "resume.example.com"，Caddy 会自动申请并续期
+# Let's Encrypt 证书，不需要 certbot 和定时任务。前提是 80/443 都通、域名已解析。
+
+:80 {
+	encode gzip zstd
+
+	# /api/* 必须放在前面：Caddy 的 handle 按书写顺序匹配，第一个命中的生效
+	handle /api/* {
+		# 剥掉 /api 前缀再转给后端，所以 FastAPI 里的路由保持 /auth/login 不变，
+		# 不用为了部署给全站加一个 /api 前缀
+		uri strip_prefix /api
+		reverse_proxy api:8000
+	}
+
+	handle {
+		root * /srv
+		# 前端用的是 history 模式（地址栏没有 #），/resumes/3 这类路径
+		# 在磁盘上并不存在，必须回退到 index.html 交给 vue-router 处理。
+		# 少了这一行，部署后刷新任意子页面都是 404
+		try_files {path} /index.html
+		file_server
+	}
+
+	# 静态资源带 hash 文件名，可以长期缓存；index.html 绝不能缓存，
+	# 否则用户会一直拿到指向旧 bundle 的旧壳
+	@immutable path /assets/*
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+	header /index.html Cache-Control "no-cache"
+}

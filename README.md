@@ -2,7 +2,7 @@
 
 上传一份 PDF / DOCX 简历，调用大模型输出结构化评分：简历完整度、内容质量、岗位匹配度，以及按优先级排序的修改建议。
 
-FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，耗时几十秒的模型调用交给独立 worker 异步执行。界面用 Vue 3 + Vite，纯前端静态产物，和后端分开部署。
+FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，耗时几十秒的模型调用交给独立 worker 异步执行。界面用 Vue 3 + Vite，纯静态产物；开发期前后端分开跑，部署时由 Caddy 同源托管。
 
 > 个人学习项目，接口契约、Prompt 和表结构都还在迭代，不保证向后兼容。
 
@@ -24,6 +24,7 @@ FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，�
 | 11 | 僵尸任务清理：beat 每 5 分钟收敛卡在 pending / running 的记录 | 已完成 |
 | 12 | CORS 收敛：来源走 `.env` 白名单，方法与请求头按下限放行 | 已完成 |
 | 13 | 前端界面：Vue 3 + Vite，上传、轮询进度、评分详情、走势与对比 | 已完成 |
+| 14 | 容器化：多阶段构建、七个服务编排、前端与接口同源 | 已完成 |
 
 后端 14 个接口全部有界面覆盖，前端在 `web/`，独立构建、独立部署。开箱能看到的是登录页 —— 需要先起后端，再 `npm run dev`（见第 7 步）。
 
@@ -42,6 +43,7 @@ FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，�
 - 表结构变更走 Alembic 迁移，不再依赖 `create_all`
 - 跨域来源走白名单配置，默认只放行本机开发端口
 - **前端界面**（`web/`，Vue 3 + Vite）：登录注册、拖拽上传、提交分析后自动轮询进度、分数环、栏目完整性、逐条建议、分数走势折线、两次分析的差异对比
+- **一条命令起全套**：`docker compose up -d --build` 拉起 MySQL、Redis、迁移、API、worker、beat 和静态站点，镜像非 root 运行，前端与接口同源
 
 ## 技术栈
 
@@ -56,6 +58,7 @@ FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，�
 | 解析 | pdfplumber · python-docx |
 | 迁移 | Alembic（`requirements.txt`，部署时要在应用之外单独跑） |
 | 检查 | mypy · pytest（`requirements-dev.txt`，不进生产依赖） |
+| 部署 | Docker 多阶段构建 · Docker Compose · Caddy 2（静态托管 + 反代，自动 HTTPS） |
 
 ## 架构
 
@@ -126,7 +129,14 @@ cd AI_Resume_Analysis
 - MySQL 8（要求 `utf8mb4`，简历里有 emoji 也不会炸）
 - Redis 7+
 
-没有 MySQL / Redis 的话，用 Docker 起一个：
+不想在宿主机装这些，直接用 Docker 起整套（含前端和反向代理），跳到 [容器化部署](#容器化部署)：
+
+```bash
+cp .env.docker.example .env.docker   # 改掉里面的密码和 SECRET_KEY
+docker compose up -d --build
+```
+
+只想手工起 MySQL / Redis、其余照下面的步骤走：
 
 ```bash
 docker run -d --name mysql -p 3306:3306 \
@@ -139,7 +149,7 @@ docker run -d --name mysql -p 3306:3306 \
 docker run -d --name redis -p 6379:6379 redis:7-alpine
 ```
 
-不想暴露 3306 的话，仓库里的 `docker-compose.yml` 用的是 3307 端口，`docker compose up -d` 即可。
+本地已经装过 MySQL 的话，别让这两个容器和它抢 3306 —— 改 `-p 3307:3306`，同时把 `.env` 里的 `DATABASE_URL` 端口跟着改。
 
 ### 2. 装依赖
 
@@ -191,9 +201,9 @@ uvicorn app.main:app --reload
 celery -A app.workers.celery_app:celery_app worker -l info -P solo -B
 ```
 
-Windows 必须加 `-P solo`（或 `-P threads`），Celery 的 prefork 模型在 Windows 上不可用。
+Windows 必须加 `-P solo`（或 `-P threads`），Celery 的 prefork 模型在 Windows 上不可用。**容器里不用加** —— 镜像基于 Linux，prefork 正常，`docker-compose.yml` 里给的是 `--concurrency 4`。
 
-`-B` 是内嵌 beat，负责定时投递清理任务（每 5 分钟扫一次僵尸记录）。它只适合单机 —— 多个 worker 各带一个 beat，同一个任务会被调度多次。生产环境要拆成三份：worker 一份、`celery ... beat` 单独一份。
+`-B` 是内嵌 beat，负责定时投递清理任务（每 5 分钟扫一次僵尸记录）。它只适合单机 —— 多个 worker 各带一个 beat，同一个任务会被调度多次。生产环境要拆成三份：worker 一份、`celery ... beat` 单独一份；容器化那套就是这么排的（`worker` 和 `beat` 是两个服务）。
 
 不想跑 beat 也可以，`-B` 去掉即可：代价是硬超时留下的 `running` 记录没人清理，前端会一直转圈。
 
@@ -238,6 +248,55 @@ VITE_API_BASE_URL=http://127.0.0.1:8000
 前端只依赖 `vue` / `vue-router` / `vite`，没有 UI 库和图表库，构建产物 96 KB（gzip 37 KB）。为什么这么选、以及几个实现上的取舍，写在 [`web/README.md`](web/README.md)。
 
 **只起前端不起后端**：页面能打开，但登录会提示「连不上后端」。这是连接被拒或 CORS 预检失败，不是前端的问题。
+
+## 容器化部署
+
+一条命令起全套：MySQL、Redis、迁移、API、worker、beat、静态站点。
+
+```bash
+cp .env.docker.example .env.docker   # 必须先改密码和 SECRET_KEY
+docker compose up -d --build
+# 打开 http://127.0.0.1:8080
+```
+
+首次构建大约 15 分钟，绝大部分时间花在 `pip install` 从 PyPI 拉包上。第二次改代码后重建只需几秒——依赖层被缓存了。
+
+```mermaid
+flowchart TB
+    B["浏览器 :8080"] --> W["web · Caddy<br/>静态文件 + /api 反代"]
+    W -->|"/api/* 剥掉前缀"| A["api · uvicorn :8000"]
+    A --> DB[("mysql")]
+    A --> R[("redis")]
+    WK["worker · prefork ×4"] --> R
+    WK --> DB
+    BT["beat · 单进程"] --> R
+```
+
+七个服务里，`api` / `worker` / `beat` **用的是同一个镜像**，只有 `command` 不同。这是当初把业务抽进 `app/services` 的回报——任务层不用单独打包。
+
+几个刻意的决定：
+
+- **前端和接口同源**。Caddy 托管 `dist`、把 `/api/*` 剥掉前缀转给后端，浏览器因此根本不发跨域请求。`.env.docker` 里 `CORS_ORIGINS` 留空就是这个原因；中间件还留着，因为本地开发（5173 → 8000）仍然需要它。
+- **迁移单独一个容器**，跑完就退出，`api` 靠 `service_completed_successfully` 等它。不在应用启动时 upgrade，是因为多实例同时起会并发执行同一批 DDL，而 MySQL 的 DDL 不能回滚，第二条必然报「列已存在」。
+- **`uploads` 用命名卷而不是 bind mount**。简历文件必须比容器活得久——不挂卷的话每次重建容器，数据库记录还在、文件没了，点详情直接 500。
+- **`beat` 单独一个进程**。多个 worker 各带一个 `-B` 时同一个定时任务会被投递多次，清理任务本身幂等所以不会出事，但那是运气不是设计。
+- **镜像里不用 root**。`appuser` 在构建时 `chown` 了 `/app/uploads`，因为命名卷首次创建时会复制镜像内该路径的属主——镜像里没有这个目录的话，卷会以 root 出现，应用写不进文件。
+
+常用命令：
+
+```bash
+docker compose ps                        # 各服务状态（migrate 显示 Exited 是正常的）
+docker compose logs -f api worker        # 同时跟两个服务的日志
+docker compose exec api ls /app/uploads  # 看用户上传的文件（命名卷不在宿主机目录里）
+docker compose down                      # 停掉并删容器，但数据卷保留
+docker compose down -v                   # 连数据一起删，慎用
+```
+
+**上线只需要改三处**：`docker/Caddyfile` 里的 `:80` 换成域名（Caddy 会自动申请并续期 Let's Encrypt 证书，不用 certbot）、`web` 服务的端口换成 `80:80` 和 `443:443`、删掉 `mysql` 那段 `3307:3306` 端口映射（那是给你本地 DataGrip 连的，不该对公网开放）。
+
+**构建慢的话**换国内镜像源：`Dockerfile` 里 `pip install` 加 `-i https://pypi.tuna.tsinghua.edu.cn/simple`，`npm ci` 前加一句 `RUN npm config set registry https://registry.npmmirror.com`。
+
+**容器环境和你本机那套是两套数据**。容器连的是 compose 里的 `mysql`（宿主 3307，容器间走 3306），本机裸跑连的是 3306 上那个 MySQL，互不影响。容器里是空库，第一次进去要自己注册账号。
 
 ## 配置项
 
@@ -325,6 +384,12 @@ LLM_MODEL=deepseek-chat
 ## 目录结构
 
 ```
+Dockerfile                  三阶段构建：前端产物 / Python 运行时 / Caddy 静态站点
+docker-compose.yml          七个服务：mysql · redis · migrate · api · worker · beat · web
+.dockerignore               构建上下文白名单，重点是挡住 .env 和 .venv
+.env.docker.example         容器环境配置模板，复制成 .env.docker 使用
+docker/
+└── Caddyfile               同源托管：静态文件 + /api 反代 + SPA 回退
 alembic.ini                 迁移配置（不含数据库地址，故意留空）
 alembic/
 ├── env.py                  迁移环境：连接串取自 settings，target_metadata 挂 Base
@@ -524,7 +589,13 @@ pdfplumber 读的是 PDF 的文字层。拍照、复印后转出来的 PDF 只�
 前者说明模型没被 import 进 `Base.metadata` —— `alembic/env.py` 里那行 `import app.models` 不能删。后者通常是 `server_default` 在作怪，本项目已把 `compare_server_default` 关掉：MySQL 会把 `CURRENT_TIMESTAMP` 回读成 `now()`，一比就永远不相等。
 
 **连不上 MySQL / 端口对不上**
-仓库里的 `docker-compose.yml` 把 MySQL 映射到 **3307**（避免和本机已装的 MySQL 抢 3306），而快速开始里那条 `docker run` 用的是 3306。`DATABASE_URL` 里的端口必须和实际映射一致。密码里含 `@` `:` `/` 时要做 URL 编码，否则会被当成连接串的分隔符。
+`docker compose` 那套把 MySQL 映射到宿主 **3307**（避开本机已装的 3306），容器之间则始终走 3306 的服务名 `mysql`——`DATABASE_URL` 里写哪个取决于你在哪儿跑：容器内写 `mysql:3306`，宿主机裸跑写 `127.0.0.1:3306`。密码里含 `@` `:` `/` 时要做 URL 编码，否则会被当成连接串的分隔符。
+
+**`migrate` 退出码非 0 / `api` 一直 unhealthy**
+先看 `docker compose logs migrate api`。最常见的两个原因：
+
+1. `.env.docker` 里 `DATABASE_URL` 的密码和 `MYSQL_PASSWORD` 不一致。注意 MySQL 只在**首次**初始化数据卷时读取 `MYSQL_PASSWORD`，之后改它不生效——必须 `docker compose down -v` 把卷删掉重建，或者进容器 `ALTER USER` 改密码。
+2. 密码里含 `@` `:` `/` `#` 没做 URL 编码，连接串被截断在第一个特殊字符处。
 
 **浏览器报 `blocked by CORS policy`**
 先看控制台里那条预检（`OPTIONS`）请求的实际响应。按出现频率排：origin 少了协议头、带了结尾斜杠（`http://a.com/` 与 `http://a.com` 是两个不同字符串）、写的是 `localhost` 而浏览器访问的是 `127.0.0.1`（两者是不同 origin）、端口不对、改完 `CORS_ORIGINS` 没重启 API。
@@ -556,10 +627,11 @@ Vite 的开发服务器自带这个回退，所以只有部署后才暴露。
 
 - [ ] Celery 监控（Flower）与队列积压告警
 - [ ] CI：把 `mypy` / `pytest` / `alembic check` / `npm run build` 串成一条流水线
+- [ ] 压测：目前没有任何性能数据（接口 QPS / P95、worker 每分钟清空多少任务），locust 跑一轮再写进文档
+- [ ] 上云：容器化已完成，还缺一台真实服务器、域名和 HTTPS；顺带验证 4 个 worker 进程下连接池是否够
 - [ ] 前端没有自动化测试（后端 126 个用例，前端 0 个；只有手写的接口封装，逻辑很薄，但路由守卫和轮询这两块值得补）
 - [ ] `latency_ms` 只反映最后一次尝试，前面超时那几次的耗时丢了
 - [ ] `REQUIRED_SECTIONS` 和 `_SECTION_HINTS` 是两份手工维护的栏目列表，改一处忘另一处会出现「完整性说缺项目经历、打分却认为有」
-- [ ] 生产部署：前端 `npm run build` 的产物要么由 nginx 托管并反代 `/api`，要么交给 FastAPI 的 `StaticFiles` 托管；后者能顺带把 CORS 完全去掉（同源）
 
 ## 说明
 

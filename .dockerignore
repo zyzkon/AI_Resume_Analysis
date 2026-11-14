@@ -1,0 +1,42 @@
+# 构建上下文只需要：app/、alembic/、alembic.ini、requirements.txt、web/、docker/Caddyfile。
+# 其余一律不进构建上下文 —— 尤其是 .env 和 .venv，前者会泄密，后者能有几百 MB。
+
+# ---- 版本控制 ----
+.git
+.gitignore
+.gitattributes
+
+# ---- Python 本地环境与缓存 ----
+.venv
+__pycache__
+*.py[cod]
+.mypy_cache
+.pytest_cache
+
+# ---- 测试与开发依赖，运行时镜像用不到 ----
+tests
+requirements-dev.txt
+mypy.ini
+pytest.ini
+test_main.http
+
+# ---- 环境变量：绝不进镜像 ----
+# 应用在容器里读的是 compose 注入的环境变量，镜像里不该有任何 .env
+.env
+.env.*
+!.env.example
+!.env.docker.example
+
+# ---- 前端本地产物 ----
+# node_modules 由 npm ci 在镜像内重装；dist 由镜像内的 npm run build 生成
+web/node_modules
+web/dist
+web/.env
+web/.env.*
+
+# ---- 运行时数据 ----
+uploads
+docker/mysql-data
+
+# ---- 文档 ----
+*.md
