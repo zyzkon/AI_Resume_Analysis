@@ -39,6 +39,26 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "mysql+pymysql://resume:resume_pass_2026@127.0.0.1:3306/resume_db?charset=utf8mb4"
     DB_ECHO: bool = False
 
+    # ---- 连接池 ----
+    # DB_POOL_SIZE + DB_MAX_OVERFLOW 是单个进程能同时持有的 MySQL 连接数上限。
+    # 它必须 **大于** MAX_CONCURRENT_REQUESTS，原因不是"多留点余量"这么随意：
+    # FastAPI 的同步依赖和同步路由是分两次进线程池的，两次之间数据库连接
+    # 仍然held着不归还，所以在途请求（占着连接）可以多于正在跑的线程数。
+    # 2026-11 压测就是在这里塌的，详见 docs/load-test.md
+    DB_POOL_SIZE: int = 20
+    DB_MAX_OVERFLOW: int = 20
+    # 池耗尽时最多等多久。正常情况下永远不该触发（在途请求数被下面的闸门限住），
+    # 保留它是为了不变量被破坏时快速失败：等 5 秒报错，好过让用户对着
+    # 转圈等 30 秒还以为是网络问题
+    DB_POOL_TIMEOUT: float = 5.0
+
+    # ---- 并发闸门 ----
+    # 在 ASGI 层挡住超出的请求，让它们在事件循环里排队，而不是进到线程池里
+    # 互相堵死。这个数同时决定同步路由的线程池容量，所以它是「这台进程
+    # 同时处理多少个请求」的唯一旋钮。调大要连 CPU 一起看：
+    # 请求是 I/O 等待（数据库）还是 CPU 计算（JSON 解析）决定了有效值
+    MAX_CONCURRENT_REQUESTS: int = 30
+
     # ---- 跨域 ----
     # 逗号分隔的完整 origin 列表。默认只放行本机 5173 端口（Vite / Vue / React 的默认端口）。
     # 为什么 localhost 和 127.0.0.1 都写上：它们是**两个不同的 origin**，
@@ -150,6 +170,35 @@ class Settings(BaseSettings):
         空字符串 -> 空列表 -> 中间件不放行任何跨域来源（同源部署的正确形态）。
         """
         return [item for item in self.CORS_ORIGINS.split(",") if item]
+
+    @property
+    def db_max_connections(self) -> int:
+        """单个进程最多持有的 MySQL 连接数。
+
+        部署多副本时要拿 MySQL 的 `max_connections` 反算：
+        `max_connections / (副本数 + worker 数)` 才是每个进程能拿到的份额。
+        默认 40 在 151 个连接下刚好放得下 3 个进程。
+        """
+        return self.DB_POOL_SIZE + self.DB_MAX_OVERFLOW
+
+    @field_validator("MAX_CONCURRENT_REQUESTS", mode="after")
+    @classmethod
+    def _check_gate(cls, value: int, info: ValidationInfo) -> int:
+        """闸门不能比连接池上限还宽，否则闸门形同虚设。
+
+        这条校验存在的意义：两个数分居两处（一个在这里，一个在 SQLAlchemy
+        的参数里），改了一个忘另一个的话，故障要等到压测或线上满负荷才
+        暴露，表现是「平时好好的，一忙就 500」。
+        """
+        if value < 1:
+            raise ValueError("MAX_CONCURRENT_REQUESTS 至少为 1")
+        pool = info.data.get("DB_POOL_SIZE", 0) + info.data.get("DB_MAX_OVERFLOW", 0)
+        if pool and value > pool:
+            raise ValueError(
+                f"MAX_CONCURRENT_REQUESTS={value} 超过了连接池上限 {pool}"
+                f"（DB_POOL_SIZE + DB_MAX_OVERFLOW），请调大连接池或调小闸门"
+            )
+        return value
 
     @property
     def llm_is_mock(self) -> bool:

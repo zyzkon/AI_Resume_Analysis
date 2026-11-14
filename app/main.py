@@ -4,6 +4,7 @@
 每条路由的具体实现都在 api/routes/ 下，各自持有自己的 router。
 """
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -11,19 +12,39 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.openapi import tags_metadata
 from app.api.routes import analyses, auth, resumes
+from app.core.concurrency import ConcurrencyGate
 from app.core.config import settings
+from app.db.session import MAX_DB_CONNECTIONS, align_thread_pool
 from app.schemas.system import HealthOut
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """启动时确保上传目录存在。
+    """启动时确保上传目录存在，并把并发上限对齐。
 
     之所以不用 @app.on_event("startup")：那个写法已废弃，
     而且它没法方便地表达"启动和关闭成对执行"。lifespan 里
     yield 之前是启动逻辑，之后是关闭逻辑（这里没有需要清理的资源）。
     """
     settings.ensure_dirs()
+    # uvicorn 只给自己的 logger 挂 handler，应用里的 logger.info 默认无处可去。
+    # 补一次 basicConfig，下面这行和 services 里的告警才会真的进容器日志。
+    # 判断 handlers 是否存在，是为了不覆盖 pytest 或上层已经配好的日志
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s:     [%(name)s] %(message)s")
+    # 同步路由的线程池容量 = 并发闸门。原因见 app/core/concurrency.py：
+    # 要限的是同时在处理的请求数，线程只是它的下游
+    align_thread_pool(settings.MAX_CONCURRENT_REQUESTS)
+    logger.info(
+        "并发闸门 %d ｜ 线程池 %d ｜ 连接池 %d（DB_POOL_SIZE %d + MAX_OVERFLOW %d）",
+        settings.MAX_CONCURRENT_REQUESTS,
+        settings.MAX_CONCURRENT_REQUESTS,
+        MAX_DB_CONNECTIONS,
+        settings.DB_POOL_SIZE,
+        settings.DB_MAX_OVERFLOW,
+    )
     yield
 
 
@@ -72,6 +93,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# 闸门要在 CORS 之前 add：后添加的中间件更靠外，所以下面那段 CORS 会在
+# 闸门之外先处理掉预检请求 —— OPTIONS 不该占用业务名额
+app.add_middleware(ConcurrencyGate, limit=settings.MAX_CONCURRENT_REQUESTS)
+
 app.add_middleware(
     CORSMiddleware,
     # 来源列在 .env 的 CORS_ORIGINS 里，逗号分隔；默认只有本机的开发端口。
@@ -114,7 +139,14 @@ app.include_router(analyses.analysis_router)
         "依赖抖一下就摘掉整个服务，会把小故障放大成全局不可用。"
     ),
 )
-def health() -> HealthOut:
+async def health() -> HealthOut:
+    """刻意写成 async def，而不是普通的 def。
+
+    同步路由会被丢进线程池排队，满负荷时探活请求排在业务请求后面，
+    3 秒超时一到容器就被标成 unhealthy —— 压测时真实发生过。
+    这个函数不碰数据库、没有阻塞调用，留在事件循环里直接返回，
+    于是"服务忙"和"服务死"能被区分开。
+    """
     return HealthOut(
         status="ok",
         version=settings.APP_VERSION,

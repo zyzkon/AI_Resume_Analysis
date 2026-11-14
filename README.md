@@ -19,12 +19,13 @@ FastAPI + SQLAlchemy + MySQL + Redis + Celery。上传和查询是同步的，�
 | 6 | Celery 异步化：202 + 任务队列 + 两层超时 | 已完成 |
 | 7 | 历史对比：分数走势与建议差异 | 已完成 |
 | 8 | OpenAPI 文档：错误码、示例、401 文案统一 | 已完成 |
-| 9 | pytest 测试套件：126 个用例，SQLite + mock，4 秒跑完 | 已完成 |
+| 9 | pytest 测试套件：131 个用例，SQLite + mock，4 秒跑完 | 已完成 |
 | 10 | Alembic 数据库迁移：基线 + 版本链，已有数据的库用 stamp 接入 | 已完成 |
 | 11 | 僵尸任务清理：beat 每 5 分钟收敛卡在 pending / running 的记录 | 已完成 |
 | 12 | CORS 收敛：来源走 `.env` 白名单，方法与请求头按下限放行 | 已完成 |
 | 13 | 前端界面：Vue 3 + Vite，上传、轮询进度、评分详情、走势与对比 | 已完成 |
 | 14 | 容器化：多阶段构建、七个服务编排、前端与接口同源 | 已完成 |
+| 15 | 压测与修复：locust 分接口三组场景，定位到请求/线程/连接三层不匹配并加并发闸门 | 已完成 |
 
 后端 14 个接口全部有界面覆盖，前端在 `web/`，独立构建、独立部署。开箱能看到的是登录页 —— 需要先起后端，再 `npm run dev`（见第 7 步）。
 
@@ -312,6 +313,10 @@ docker compose down -v                   # 连数据一起删，慎用
 | | `ACCESS_TOKEN_EXPIRE_MINUTES` | `1440` | 24 小时 |
 | 数据库 | `DATABASE_URL` | 见 `.env.example` | 必须以 `mysql+pymysql://` 开头，有校验器拦 |
 | | `DB_ECHO` | `false` | 打开后每条 SQL 打印到控制台 |
+| 并发 | `MAX_CONCURRENT_REQUESTS` | `30` | 同时在处理的请求数上限，超出的在事件循环里排队；启动时同步路由的线程池会对齐到这个值 |
+| | `DB_POOL_SIZE` | `20` | 常驻连接数 |
+| | `DB_MAX_OVERFLOW` | `20` | 溢出连接数；两者之和必须 ≥ `MAX_CONCURRENT_REQUESTS`，否则启动报错 |
+| | `DB_POOL_TIMEOUT` | `5` | 池耗尽的等待上限（秒），正常不会触发，留着让不变量被破坏时快速失败 |
 | 跨域 | `CORS_ORIGINS` | 本机 `:5173` | 逗号分隔、必须带协议头、不能带路径。留空 = 不允许跨域 |
 | 上传 | `UPLOAD_DIR` | `uploads` | 相对路径按项目根目录解析 |
 | | `MAX_UPLOAD_MB` | `5` | 边读边累加，超限立刻中断 |
@@ -405,9 +410,10 @@ app/
 │   └── routes/           auth / resumes / analyses 三组端点，14 个接口
 ├── core/
 │   ├── config.py         Settings，环境变量的唯一来源
+│   ├── concurrency.py    请求级并发闸门，挡住超出的请求避免两个池互锁
 │   └── security.py       密码哈希、JWT 签发与校验
 ├── db/
-│   ├── session.py        engine、连接池、SessionLocal
+│   ├── session.py        engine、连接池、SessionLocal、线程池对齐
 │   └── init_db.py        开发兜底建表，正式建表走 Alembic
 ├── models/               SQLAlchemy 表定义
 │   ├── user.py           users：邮箱唯一，密码只存 bcrypt 哈希
@@ -446,6 +452,12 @@ web/                        前端（Vue 3 + Vite），独立构建与部署
     ├── styles.css          设计变量与公共类，没有 UI 库
     ├── components/         ScoreRing（SVG 圆环）、StatusPill、TrendChart（SVG 折线）
     └── views/              Login / ResumeList / ResumeDetail / Analysis / Compare
+docs/
+└── load-test.md            压测报告：环境、方法、结果、瓶颈推导、优化方向
+tools/                      压测工具，不进镜像也不进生产依赖
+├── prepare_load_test.py    造一条压测数据链（账号 / 简历 / 一条已完成分析）+ 输出 token
+├── locustfile.py           按真实比例压四个接口，`--tags` 可单独压某一个
+└── burst_submit.py         并发灌任务，测 worker 的消化速度
 ```
 
 分层的意义：`services/` 里的东西既能被路由调用，也能被 worker 调用，还能被脚本和单元测试直接调用 —— 想批量重跑历史分析，`for` 循环调 `execute_analysis(db, id)` 就行，不用起 Redis。
@@ -518,6 +530,8 @@ python -m alembic check                      # 库结构与模型是否一致，
 
 **连接池**：`pool_pre_ping` + `pool_recycle=3600` 应付 MySQL 的 `wait_timeout`；prefork 模式下子进程会在 `worker_process_init` 里 `engine.dispose(close=False)`，否则多个进程共用同一个 TCP 连接，会出现只在高并发下才犯的「Packet sequence number wrong」。
 
+**并发闸门**（`app/core/concurrency.py`）：在 ASGI 层限制同时在处理的请求数，超出的在事件循环里排队。它不是"限流"，而是防死锁 —— 原因见下面的[性能](#性能)一节，简单说就是「同步依赖 + 同步路由」分多次进线程池、连接却在阶段之间不归还，光靠调大连接池救不了。三层关系 **闸门 ≤ 线程池 < 连接池** 在启动时由代码对齐并用校验器守住。
+
 **上传六步**：扩展名 → 累加大小 → 魔数 → 落盘 → 解析 → 写库。后三步任一失败都要删掉已落盘的文件，否则磁盘会被垃圾文件慢慢堆满。
 
 **输出容错分层**：数值越界钳制（105 → 100）、枚举拼错归一化（`urgent` → `high`）、列表过长截断，只有「不是 JSON」「缺必填字段」才触发重试 —— 目的是把重试次数压到最低，每次重试都在烧 token。
@@ -546,12 +560,32 @@ python -m alembic check                      # 库结构与模型是否一致，
 
 `allow_credentials=False` 与「用 Bearer token」并不矛盾，这是最容易搞混的一处：CORS 里的 credentials 只涵盖 **cookie、浏览器自带的 Basic 认证、TLS 客户端证书**；代码里手动塞进 `Authorization` 头的 token 属于普通请求头，归 `allow_headers` 管。哪天改成用 cookie 存 token 才需要打开它，同时 `allow_origins` 必须全是具体域名（规范里 `*` 与 credentials 互斥）。
 
+## 性能
+
+容器化环境（Docker Desktop，8 核 / 7.76 GiB，api 单进程）下的实测数据。完整方法、瓶颈推导（含一次修错方向的过程）和优化方向见 [`docs/load-test.md`](docs/load-test.md)。
+
+| 场景 | 并发 | 吞吐 | P95 | 失败率 |
+|---|---|---|---|---|
+| 混合流量（按真实比例） | 100 | 189 req/s | 280 ms | 0 |
+| `GET /analyses/{id}` | 100 | 254 req/s | 140 ms | 0 |
+| `GET /analyses/{id}` | 200 | 259 req/s | 540 ms | 0 |
+| `GET /analyses/{id}` | 300 | 271 req/s | 850 ms | 0 |
+| `POST /auth/login` | 50 | 26 req/s | 1900 ms | 0 |
+
+**单实例容量约 260 req/s，超过之后是排队而不是报错。** 300 并发仍然零失败，只是 P50 从 57 ms 涨到 760 ms —— 这是有意的：宁可慢，不要 500。
+
+做法是在 ASGI 层加一个请求闸门（`app/core/concurrency.py`，`MAX_CONCURRENT_REQUESTS=30`），三层容量必须满足 **闸门 ≤ 线程池 < 连接池**（30 / 30 / 40）。为什么连接池要比闸门宽，是这轮压测里最反直觉的一条：FastAPI 处理「同步依赖 + 同步路由」的请求要分三次进线程池（依赖、路由、清理），数据库连接在第一次查库时拿到、到清理时才归还 —— 中间那两个间隙里**线程已经归还但连接还在手里**。所以在途请求（占着连接）可以多于线程数，光是"把线程池和连接池调成一样大"反而更糟（实测失败率从 2% 涨到 12%，`docs/load-test.md` 记了这段走错路的过程）。
+
+另外两条容易踩的：`/health` 改成 `async def` 并豁免闸门（它被排队会让 healthcheck 3 秒超时而误判容器死亡）；启动时校验 `MAX_CONCURRENT_REQUESTS ≤ DB_POOL_SIZE + DB_MAX_OVERFLOW`，否则两个数分居两处、改一个忘一个，故障只在满负荷时出现。
+
+最值得记的一条：**最先崩的从来不是数据库**，修复前后 MySQL 都只用了 14~23 个连接（上限 151）、CPU 8.7%，崩的永远是 API 进程内部的资源编排。
+
 ## 代码检查
 
 ```bash
 pip install -r requirements-dev.txt   # mypy + pytest + reportlab，不进生产依赖
-mypy                                  # 配置在 mypy.ini，默认检查 app/ 下的 35 个文件
-pytest                                # 配置在 pytest.ini，126 个用例约 4 秒
+mypy                                  # 配置在 mypy.ini，默认检查 app/ 下的 36 个文件
+pytest                                # 配置在 pytest.ini，131 个用例约 4 秒
 python -m alembic check               # 库结构与模型是否一致（可选，但要连真库）
 
 cd web && npm run build               # 前端构建，能抓语法与导入错误，产物在 dist/
@@ -627,9 +661,9 @@ Vite 的开发服务器自带这个回退，所以只有部署后才暴露。
 
 - [ ] Celery 监控（Flower）与队列积压告警
 - [ ] CI：把 `mypy` / `pytest` / `alembic check` / `npm run build` 串成一条流水线
-- [ ] 压测：目前没有任何性能数据（接口 QPS / P95、worker 每分钟清空多少任务），locust 跑一轮再写进文档
-- [ ] 上云：容器化已完成，还缺一台真实服务器、域名和 HTTPS；顺带验证 4 个 worker 进程下连接池是否够
-- [ ] 前端没有自动化测试（后端 126 个用例，前端 0 个；只有手写的接口封装，逻辑很薄，但路由守卫和轮询这两块值得补）
+- [ ] `trend` 每次反序列化 50 条历史 JSON 并逐条校验，是全表最重的接口；闸门修好之后 P50 从 610 ms 降到 170 ms，但它仍是 CPU 密集路径，值得加条数上限或对 `result` 做列裁剪
+- [ ] 上云：容器化已完成，还缺一台真实服务器、域名和 HTTPS；多副本时总并发是 `MAX_CONCURRENT_REQUESTS × 副本数`，要按 MySQL 的 `max_connections` 重新核算
+- [ ] 前端没有自动化测试（后端 131 个用例，前端 0 个；只有手写的接口封装，逻辑很薄，但路由守卫和轮询这两块值得补）
 - [ ] `latency_ms` 只反映最后一次尝试，前面超时那几次的耗时丢了
 - [ ] `REQUIRED_SECTIONS` 和 `_SECTION_HINTS` 是两份手工维护的栏目列表，改一处忘另一处会出现「完整性说缺项目经历、打分却认为有」
 
