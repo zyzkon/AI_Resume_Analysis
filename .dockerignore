@@ -15,6 +15,7 @@ __pycache__
 
 # ---- 测试与开发依赖，运行时镜像用不到 ----
 tests
+tools
 requirements-dev.txt
 mypy.ini
 pytest.ini
